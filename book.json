@@ -1,0 +1,13 @@
+{
+  "title": "ButterPay Documentation",
+  "description": "Non-custodial crypto payment infrastructure for stablecoin settlement.",
+  "ignores": [
+    "node_modules",
+    "package.json",
+    "package-lock.json",
+    ".github",
+    ".gitignore",
+    "_book",
+    "CNAME"
+  ]
+}
