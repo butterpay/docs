@@ -93,6 +93,8 @@ are omitted.
 | `subscriberAddress` | string | Customer wallet address |
 | `cyclesCharged` | number | Number of billing cycles completed so far |
 | `cyclesTotal` | number | Total billing cycles for the subscription |
+| `errorCode` | string | Machine-readable failure code. Present on `payment.failed` and `subscription.charge_failed` events only. See [Error codes](#error-codes). |
+| `errorMessage` | string | Human-readable description of the failure. Present alongside `errorCode`. |
 | `timestamp` | string | ISO 8601 timestamp of the event |
 
 ### Example: `payment.confirmed`
@@ -115,6 +117,26 @@ are omitted.
 }
 ```
 
+### Example: `payment.failed`
+
+```json
+{
+  "event": "payment.failed",
+  "invoiceId": "inv_01hwz4m8y3g9c5d7f8h0j2kn",
+  "merchantOrderId": "order-9182",
+  "amountUsd": "49.99",
+  "tokenAmount": "49.99",
+  "paymentMethod": "crypto",
+  "chain": "arbitrum",
+  "token": "USDT",
+  "txHash": "0xabc123def456...",
+  "eventVerified": false,
+  "errorCode": "USER_BALANCE_INSUFFICIENT",
+  "errorMessage": "Subscriber wallet has insufficient token balance.",
+  "timestamp": "2026-04-27T14:32:01.000Z"
+}
+```
+
 ### Example: `subscription.charged`
 
 ```json
@@ -131,6 +153,49 @@ are omitted.
   "timestamp": "2026-04-27T14:32:01.000Z"
 }
 ```
+
+### Example: `subscription.charge_failed`
+
+```json
+{
+  "event": "subscription.charge_failed",
+  "subscriptionId": "sub_01hwz9p4q5r6s7t8u9v0w1xy",
+  "planId": "plan_01hwz2a3b4c5d6e7f8g9h0jk",
+  "subscriberAddress": "0xCustomerWalletAddress",
+  "amountUsd": "19.99",
+  "chain": "arbitrum",
+  "token": "USDT",
+  "cyclesCharged": 3,
+  "cyclesTotal": 12,
+  "errorCode": "USER_ALLOWANCE_INSUFFICIENT",
+  "errorMessage": "Approved allowance was less than the charge amount.",
+  "timestamp": "2026-04-27T14:32:01.000Z"
+}
+```
+
+---
+
+## Error codes
+
+Failed payment and subscription events include a structured `errorCode` so you can route
+programmatically — for example, notifying the user to top up versus ignoring an error that is
+on ButterPay's side. Internal infrastructure errors are not delivered as webhooks; they go to
+our ops alerts. The codes you may receive are listed below.
+
+| Code | When it fires | Suggested action |
+|------|---------------|------------------|
+| `USER_BALANCE_INSUFFICIENT` | Subscriber wallet has insufficient token balance | Notify user; consider letting them top up before retrying. |
+| `USER_ALLOWANCE_INSUFFICIENT` | Approved allowance was less than the charge amount | Ask user to re-approve with a higher amount. |
+| `USER_ALLOWANCE_REVOKED` | Subscriber revoked the approval | Subscription is effectively cancelled by the user; mark as churned. |
+| `SUBSCRIPTION_EXPIRED` | On-chain subscription has reached its `cyclesTotal` | End-of-life; offer a renewal. |
+| `CONTRACT_REVERTED` | On-chain transaction reverted with an unrecognized reason | Inspect the failed tx hash on the explorer; may indicate a token blacklist or paused contract. |
+| `CHARGE_AMOUNT_MISMATCH` | On-chain transferred amount does not match the invoice amount within tolerance | Treat as failed; do not deliver goods. May indicate front-running or fee-on-transfer token mismatch. |
+
+Codes `RELAYER_GAS_INSUFFICIENT`, `RELAYER_KEY_MISSING`, and `RELAYER_TX_FAILED` indicate a
+problem on ButterPay's infrastructure and are never sent to merchants. They are routed to
+internal ops alerts. If you observe a failed event with no `errorCode`, or a delivery that
+never arrived, check your logs endpoint and contact support — do not attempt to handle these
+codes in your integration.
 
 ---
 
@@ -414,6 +479,12 @@ Registration fails with `400` if:
 Use a public HTTPS endpoint. For local development, tools such as
 [ngrok](https://ngrok.com) or [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 expose a local server under a public HTTPS URL.
+
+**Webhook payload includes `errorCode` field**
+
+See [Error codes](#error-codes) for the full list of merchant-visible codes and recommended
+actions per code. Codes beginning with `RELAYER_` indicate a ButterPay infrastructure issue
+and are never sent to your endpoint.
 
 **Retries exhausted — delivery marked failed**
 
