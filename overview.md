@@ -10,14 +10,17 @@ works without modification. A flat 0.8% service fee is deducted at the moment of
 
 1. **Register** — create a merchant account, configure a receiving address, and generate an API key
    in the dashboard Settings page.
-2. **Create invoice** — `POST /v1/invoices` with `amountUsd` and an optional `externalId`. The API
-   returns an `invoiceId` and a hosted payment URL (`pay.butterpay.io/pay/<invoiceId>`).
-3. **Customer pays** — the customer opens the payment URL, connects a wallet, selects a chain and
-   token, and signs the on-chain transaction. `PaymentRouter` atomically splits the transfer:
-   99.2% to the merchant address and 0.8% to the fee collector in a single transaction.
-4. **Webhook delivered** — the backend detects the `PaymentProcessed` on-chain event, verifies the
-   amount, marks the invoice `confirmed`, and POST the `payment.confirmed` event to the merchant's
-   configured webhook URL.
+2. **Create invoice** — `POST /v1/invoices` with `amountUsd` and an optional `merchantOrderId` /
+   `description`. The API returns the full invoice row including `id` (DB id, e.g. `inv_…`),
+   `onChainInvoiceId` (bytes32 used on chain), and a hosted `payUrl`
+   (`pay.butterpay.io/pay/<id>`).
+3. **Customer pays** — the customer opens the payment URL, connects a wallet, selects a token,
+   and signs `approve` + `pay()` on `PayRouter`. The contract atomically splits the transfer:
+   99.2% to the merchant's `receiverAddress`, 0.8% to the fee collector — non-custodial, in a
+   single transaction.
+4. **Webhook delivered** — the backend's chain-listener observes the `PaymentProcessed` event,
+   marks the invoice `PAID`, and POSTs `payment.confirmed` to the merchant's configured
+   webhook URL (HMAC-signed).
 
 ## Architecture
 

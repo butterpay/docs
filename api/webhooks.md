@@ -22,7 +22,7 @@ All endpoints require authentication. `ListLogs`, `GetSecret`, and `SendTest` ac
 Return paginated webhook delivery logs for the authenticated merchant.
 
 - **Method**: `GET`
-- **Path**: `/v1/webhooks/logs`
+- **Path**: `/v1/webhook-logs`
 - **Auth**: `apiKeyAuth (Bearer or X-Api-Key)`
 - **Description**: Fetches webhook delivery records scoped to the current merchant, ordered newest
   first. Each record shows the target URL, HTTP status received, number of delivery attempts, and
@@ -35,8 +35,10 @@ Query string parameters:
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `limit` | integer | No | Maximum records to return. Defaults to `50`, capped at `100`. |
-| `offset` | integer | No | Number of records to skip for pagination. Defaults to `0`. |
+| `page` | integer | No | 1-indexed page number. Defaults to `1`. |
+| `pageSize` | integer | No | Records per page. Defaults to `50`, capped at `100`. |
+| `event` | string | No | Filter by event name (`payment.confirmed`, `subscription.charged`, …). |
+| `success` | `"true"` \| `"false"` | No | Filter by delivery outcome (HTTP 2xx response from your endpoint). |
 
 ### Returns
 
@@ -68,7 +70,7 @@ Query string parameters:
 **Request:**
 
 ```bash
-curl https://api.butterpay.io/v1/webhooks/logs?limit=20&offset=0 \
+curl https://api.butterpay.io/v1/webhook-logs?page=1&pageSize=20 \
   -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
 ```
 
