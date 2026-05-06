@@ -1,757 +1,513 @@
 # Plans & Subscriptions API
 
-ButterPay subscriptions use a one-time on-chain `approve(amount × cycles)` (or EIP-2612 permit where
-supported) followed by a `subscribe()` transaction. The contract auto-charges the merchant per
-period.
+ButterPay V2 subscriptions are **non-custodial** and contract-driven. The flow has three actors:
 
-A merchant defines a **plan** that specifies the charge amount, interval, and maximum number of
-billing cycles. A subscriber visits the hosted subscription page, approves the total spend, and
-signs the `subscribe()` transaction. The backend records the resulting subscription and a scheduler
-executes recurring charges automatically. Merchants receive webhook events at each stage. See
-[Webhooks](../webhooks.md) for payload shapes.
+1. **Merchant** signs `createPlan()` on the `SubscriptionManager` contract to register a plan on chain. The backend builds the calldata; the merchant wallet sends the transaction.
+2. **Subscriber** signs `approve()` + `subscribe()` directly against the contract — no backend POST needed.
+3. **Backend chain-listener** observes `PlanCreated`, `Subscribed`, `Charged`, `Cancelled`, `ExpiredByFailure`, `Resubscribed`, and `PlanActiveChanged` events and reconciles them into the `plans` and `subscriptions` tables. Webhooks fire from those event handlers.
 
-All authenticated endpoints require an `X-Api-Key` header. See
-[Authentication](../authentication.md) for details.
+Because creation/cancellation are on-chain actions, the relevant POST endpoints return an **intent** (`{ to, chainId, encodedTx, ... }`) rather than mutating state directly. The wallet signs and broadcasts; the listener picks up the result.
+
+All authenticated endpoints accept either a session JWT (`Authorization: Bearer ...`) or `X-API-Key`. See [Authentication](../authentication.md).
 
 ---
 
-- [CreatePlan](#createplan)
-- [ListPlans](#listplans)
-- [GetPlan](#getplan)
-- [UpdatePlan](#updateplan)
-- [DeletePlan](#deleteplan)
-- [RegisterSubscription](#registersubscription)
-- [CreateSubscription](#createsubscription)
-- [ListSubscriptions](#listsubscriptions)
-- [GetSubscription](#getsubscription)
-- [CancelSubscription](#cancelsubscription)
+## Contents
+
+- [Endpoint summary](#endpoint-summary)
+- Plans
+  - [CreatePlan](#createplan)
+  - [ListPlans](#listplans)
+  - [GetPlan](#getplan)
+  - [Deactivating a plan](#deactivating-a-plan)
+- Subscriptions
+  - [Subscribing on chain](#subscribing-on-chain)
+  - [ListSubscriptions](#listsubscriptions)
+  - [GetSubscription](#getsubscription)
+  - [GetSubscriptionCharges](#getsubscriptioncharges)
+  - [CancelSubscription](#cancelsubscription)
+- [Webhooks fired](#webhooks-fired)
+- [Field reference](#field-reference)
+
+---
+
+## Endpoint summary
+
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `POST` | `/v1/plans` | merchant | Build `createPlan()` intent for the merchant wallet to sign |
+| `GET` | `/v1/plans` | merchant | List plans owned by the authenticated merchant |
+| `GET` | `/v1/plans/:id` | public | Fetch a plan by `pln_*` id or `0x...` `onChainPlanId` |
+| `GET` | `/v1/subscriptions` | merchant | List subscriptions for plans owned by the merchant |
+| `GET` | `/v1/subscriptions/:id` | merchant | Fetch a single subscription |
+| `GET` | `/v1/subscriptions/:id/charges` | merchant | On-chain `Charged` event history for a subscription |
+| `POST` | `/v1/subscriptions/:id/cancel` | merchant | Build `merchantCancel()` intent for the merchant wallet to sign |
+
+There is **no** API endpoint for the subscriber to "create a subscription" — that step is on-chain. See [Subscribing on chain](#subscribing-on-chain).
 
 ---
 
 ## CreatePlan
 
-Create a new subscription plan. The plan defines how much is charged, how often, and for how many
-cycles. Once created, the plan is immediately usable on the hosted subscription page at
-`pay.butterpay.io/subscribe/<id>`.
+Builds an unsigned `createPlan()` calldata blob for the merchant's wallet to send to the `SubscriptionManager` contract. Inserts a row in the `plans` table with `active=false`; the chain-listener flips `active=true` after observing the `PlanCreated` event.
 
 - **Method**: `POST`
-- **Path**: `/v1/subscription-plans`
-- **Auth**: `X-Api-Key`
-- **Description**: Creates a subscription plan scoped to the authenticated merchant. Returns the
-  full plan record. The plan is active by default and can be linked to from the hosted subscription
-  page immediately. Use [UpdatePlan](#updateplan) to toggle `active` off and stop new signups
-  without affecting existing subscribers.
+- **Path**: `/v1/plans`
+- **Auth**: Bearer JWT or `X-API-Key`
 
-### Parameters
+The merchant must already be registered on chain (`merchants.onChainMerchantId` must be set). If not, the request returns `400`.
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `name` | string | Yes | Human-readable plan name shown on the subscription page, e.g. `"Pro Monthly"`. |
-| `amountUsd` | string | Yes | Decimal USD amount charged each interval, e.g. `"9.99"`. Must be positive. |
-| `intervalSeconds` | number | Yes | Billing interval in seconds. Must be `>= 86400` (1 day). Common values: `2592000` (30 days), `7776000` (90 days), `31536000` (365 days). |
-| `cycles` | number | Yes | Total number of billing cycles before the subscription completes. Range: 1–120. |
-| `description` | string | No | Optional description shown to the subscriber. |
-| `chain` | string | No | Blockchain to use for charges. Defaults to `"arbitrum"`. |
-| `token` | string | No | Token symbol for charges. Defaults to `"USDT"`. |
+### Request body
 
-### Returns
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `externalPlanCode` | string | yes | Stable per-merchant code, 3–64 chars matching `^[a-z0-9_-]{3,64}$`. Used as the salt input. Must be unique per merchant. |
+| `tokenAddress` | string | yes | ERC-20 address charged each cycle. Will be EIP-55 checksummed. |
+| `amount` | string | yes | Amount **in smallest units** of the token (decimal string, e.g. `"9990000"` for `9.99` USDC with 6 decimals). |
+| `monthsPerCycle` | integer | yes | Cycle length in months. Range: `1..12`. |
+| `bufferTimeSeconds` | integer | yes | Grace period after `nextDueAt` before the subscription is treated as failed. Must satisfy `0 <= bufferTimeSeconds < monthsPerCycle * 30 * 86400`. |
+| `metadata` | object | no | Arbitrary JSON. Hashed (keccak256 of the canonical JSON with sorted keys) into `metadataHash` and stored on chain. Defaults to `{}`. |
+| `chainId` | integer | yes | EVM chain id. Currently supported: `42161` (Arbitrum One), `421614` (Arbitrum Sepolia). |
+
+### Response (HTTP 201)
 
 ```json
 {
-  "id": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "name": "Pro Monthly",
-  "description": "Full access to all features",
-  "amountUsd": "9.99",
-  "interval": 2592000,
-  "cycles": 12,
-  "chain": "arbitrum",
-  "token": "USDT",
-  "active": true,
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-04-27T12:00:00.000Z"
+  "to": "0xSubscriptionManagerAddress",
+  "chainId": 42161,
+  "planId": "0xabc...32bytes",
+  "salt": "0xdef...32bytes",
+  "metadataHash": "0x111...32bytes",
+  "encodedTx": "0xa9059cbb..."
 }
 ```
 
-### Example
+| Field | Description |
+|-------|-------------|
+| `to` | `SubscriptionManager` address for `chainId`. The wallet sends to this. |
+| `planId` | Deterministic on-chain plan id (`bytes32`). Computed as `keccak256(merchantOnChainId, salt)`. Use this to read the plan on chain or to reference it from `subscribe()`. |
+| `salt` | Plan salt derived from `externalPlanCode`. |
+| `metadataHash` | `keccak256(canonical JSON of metadata)`. |
+| `encodedTx` | ABI-encoded calldata for `createPlan(...)`. |
 
-**Request:**
+### How the merchant signs
+
+```ts
+import { createWalletClient, http } from "viem";
+import { arbitrum } from "viem/chains";
+
+const intent = await fetch("https://api.butterpay.io/v1/plans", {
+  method: "POST",
+  headers: { "X-API-Key": apiKey, "Content-Type": "application/json" },
+  body: JSON.stringify({
+    externalPlanCode: "pro_monthly",
+    tokenAddress: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", // USDC arb
+    amount: "9990000", // 9.99 USDC (6 decimals)
+    monthsPerCycle: 1,
+    bufferTimeSeconds: 86400,
+    metadata: { name: "Pro Monthly" },
+    chainId: 42161,
+  }),
+}).then((r) => r.json());
+
+const wallet = createWalletClient({ chain: arbitrum, transport: http() /* ... */ });
+const txHash = await wallet.sendTransaction({
+  to: intent.to,
+  data: intent.encodedTx,
+});
+```
+
+After the transaction confirms, the chain-listener observes `PlanCreated`, calls `applyPlanCreated`, and flips `plans.active` to `true`. A `plan.created` webhook fires to the merchant.
+
+### curl
 
 ```bash
-curl -X POST https://api.butterpay.io/v1/subscription-plans \
-  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..." \
+curl -X POST https://api.butterpay.io/v1/plans \
+  -H "X-API-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
-    "name": "Pro Monthly",
-    "description": "Full access to all features",
-    "amountUsd": "9.99",
-    "intervalSeconds": 2592000,
-    "cycles": 12,
-    "chain": "arbitrum",
-    "token": "USDT"
+    "externalPlanCode": "pro_monthly",
+    "tokenAddress": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+    "amount": "9990000",
+    "monthsPerCycle": 1,
+    "bufferTimeSeconds": 86400,
+    "metadata": {"name": "Pro Monthly"},
+    "chainId": 42161
   }'
-```
-
-**Response** (HTTP 201):
-
-```json
-{
-  "id": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "name": "Pro Monthly",
-  "description": "Full access to all features",
-  "amountUsd": "9.99",
-  "interval": 2592000,
-  "cycles": 12,
-  "chain": "arbitrum",
-  "token": "USDT",
-  "active": true,
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-04-27T12:00:00.000Z"
-}
 ```
 
 ---
 
 ## ListPlans
 
-Return all subscription plans belonging to the authenticated merchant, ordered by creation date
-descending.
+Returns every plan owned by the authenticated merchant, including pending (`active=false`) plans whose `PlanCreated` event has not yet been observed.
 
 - **Method**: `GET`
-- **Path**: `/v1/subscription-plans`
-- **Auth**: `X-Api-Key`
-- **Description**: Returns every plan registered to the merchant, including inactive ones. Use the
-  `active` field to distinguish plans that accept new subscribers from those that have been
-  deactivated. Inactive plans continue to serve existing subscriptions until they complete.
+- **Path**: `/v1/plans`
+- **Auth**: Bearer JWT or `X-API-Key`
 
-### Parameters
-
-None.
-
-### Returns
+### Response (HTTP 200)
 
 ```json
 {
   "data": [
     {
-      "id": "plan_01hwzq3k5n8ej4v2b7r9abc123",
+      "id": "pln_1a2b3c4d5e6f7g8h9i0j1k2l",
       "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-      "name": "Pro Monthly",
-      "description": "Full access to all features",
-      "amountUsd": "9.99",
-      "interval": 2592000,
-      "cycles": 12,
-      "chain": "arbitrum",
-      "token": "USDT",
+      "externalPlanCode": "pro_monthly",
+      "onChainPlanId": "0xabc...32bytes",
+      "tokenAddress": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+      "amount": "9990000",
+      "monthsPerCycle": 1,
+      "bufferTimeSeconds": 86400,
+      "metadataHash": "0x111...32bytes",
       "active": true,
-      "createdAt": "2026-04-27T12:00:00.000Z",
-      "updatedAt": "2026-04-27T12:00:00.000Z"
+      "chainId": 42161,
+      "createdAt": "2026-04-27T12:00:00.000Z"
     }
   ],
   "count": 1
 }
 ```
 
-### Example
-
-**Request:**
+### curl
 
 ```bash
-curl https://api.butterpay.io/v1/subscription-plans \
-  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
-```
-
-**Response** (HTTP 200):
-
-```json
-{
-  "data": [...],
-  "count": 3
-}
+curl https://api.butterpay.io/v1/plans \
+  -H "X-API-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
 ---
 
 ## GetPlan
 
-Retrieve a single plan by ID. This endpoint is **public** — no API key is required. It is used by
-the hosted subscription page to display plan details and the merchant's receiving address to the
-subscriber before they approve and sign.
+Public endpoint used by the hosted subscribe page (`pay.butterpay.io/subscribe/:planId`). It accepts **either** the `pln_*` database id **or** the on-chain `0x...` `onChainPlanId` as the path parameter.
+
+Returns `404` when the plan does not exist or is not yet `active=true` (i.e. the `PlanCreated` event has not been observed yet, or the plan has been deactivated on chain).
 
 - **Method**: `GET`
-- **Path**: `/v1/subscription-plans/:id`
+- **Path**: `/v1/plans/:id`
 - **Auth**: Public
-- **Description**: Returns the plan record plus the merchant's name and receiving addresses for the
-  plan's chain. Returns `404` if the plan does not exist or has been deactivated (`active: false`).
-  The `merchantReceivingAddresses` field is included so the hosted page can construct the on-chain
-  `subscribe()` call without a separate authenticated request.
 
-### Parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | string (path) | Yes | Plan ID. |
-
-### Returns
+### Response (HTTP 200)
 
 ```json
 {
-  "id": "plan_01hwzq3k5n8ej4v2b7r9abc123",
+  "id": "pln_1a2b3c4d5e6f7g8h9i0j1k2l",
   "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "name": "Pro Monthly",
-  "description": "Full access to all features",
-  "amountUsd": "9.99",
-  "interval": 2592000,
-  "cycles": 12,
-  "chain": "arbitrum",
-  "token": "USDT",
+  "externalPlanCode": "pro_monthly",
+  "onChainPlanId": "0xabc...32bytes",
+  "tokenAddress": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+  "amount": "9990000",
+  "monthsPerCycle": 1,
+  "bufferTimeSeconds": 86400,
+  "metadataHash": "0x111...32bytes",
   "active": true,
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-04-27T12:00:00.000Z",
-  "merchantName": "Acme Store",
-  "merchantReceivingAddresses": {
-    "arbitrum": "0xMerchantWalletAddress"
-  }
+  "chainId": 42161,
+  "createdAt": "2026-04-27T12:00:00.000Z"
 }
 ```
 
-### Example
-
-**Request:**
+### curl
 
 ```bash
-curl https://api.butterpay.io/v1/subscription-plans/plan_01hwzq3k5n8ej4v2b7r9abc123
-```
+# By DB id
+curl https://api.butterpay.io/v1/plans/pln_1a2b3c4d5e6f7g8h9i0j1k2l
 
-**Response** (HTTP 200):
-
-```json
-{
-  "id": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "name": "Pro Monthly",
-  "description": "Full access to all features",
-  "amountUsd": "9.99",
-  "interval": 2592000,
-  "cycles": 12,
-  "chain": "arbitrum",
-  "token": "USDT",
-  "active": true,
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-04-27T12:00:00.000Z",
-  "merchantName": "Acme Store",
-  "merchantReceivingAddresses": {
-    "arbitrum": "0xMerchantWalletAddress"
-  }
-}
+# By on-chain plan id (bytes32 hex)
+curl https://api.butterpay.io/v1/plans/0xabc1234567890abcdef1234567890abcdef1234567890abcdef1234567890abc
 ```
 
 ---
 
-## UpdatePlan
+## Deactivating a plan
 
-Update mutable fields on an existing plan. Only the authenticated merchant who owns the plan may
-update it.
+V2 has **no** REST endpoint for deactivating plans — this is a deliberate non-custodial design. The merchant calls `SubscriptionManager.deactivatePlan(bytes32 planId)` directly from the same wallet that owns the on-chain merchant record.
 
-- **Method**: `PATCH`
-- **Path**: `/v1/subscription-plans/:id`
-- **Auth**: `X-Api-Key`
-- **Description**: Applies a partial update to the plan. Accepted fields are `name`, `description`,
-  and `active`. Setting `active: false` stops the hosted subscription page from accepting new
-  signups while keeping all existing subscriptions running to completion. This is the recommended
-  way to retire a plan. Returns `404` if the plan does not exist or belongs to a different merchant.
+```ts
+import { encodeFunctionData } from "viem";
+import { subscriptionManagerAbi } from "./abi";
 
-### Parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | string (path) | Yes | Plan ID. |
-| `name` | string | No | New display name. |
-| `description` | string | No | New description. |
-| `active` | boolean | No | Set to `false` to stop accepting new subscribers. Existing subscribers are unaffected. |
-
-### Returns
-
-The full updated plan record (same shape as [GetPlan](#getplan) minus the merchant fields).
-
-### Example
-
-**Request:**
-
-```bash
-curl -X PATCH https://api.butterpay.io/v1/subscription-plans/plan_01hwzq3k5n8ej4v2b7r9abc123 \
-  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "active": false
-  }'
+const data = encodeFunctionData({
+  abi: subscriptionManagerAbi,
+  functionName: "deactivatePlan",
+  args: [onChainPlanId],
+});
+await wallet.sendTransaction({ to: subscriptionManagerAddress, data });
 ```
 
-**Response** (HTTP 200):
+When the `PlanActiveChanged(active=false)` event is observed, `applyPlanActiveChanged` flips `plans.active` to `false` and a `plan.deactivated` webhook fires. Existing subscriptions are then transitioned to `INACTIVATED_BY_PLAN_CLOSED` by the listener as the contract emits its own `Cancelled`-class events for affected subs.
 
-```json
-{
-  "id": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "name": "Pro Monthly",
-  "description": "Full access to all features",
-  "amountUsd": "9.99",
-  "interval": 2592000,
-  "cycles": 12,
-  "chain": "arbitrum",
-  "token": "USDT",
-  "active": false,
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-04-27T14:00:00.000Z"
-}
-```
+A helper endpoint that returns a `deactivatePlan()` intent will be added in a later release. Until then, build the calldata client-side as shown above.
 
 ---
 
-## DeletePlan
+## Subscribing on chain
 
-Permanently delete a plan. Deletion is blocked when the plan has active or past-due subscribers.
+There is no `POST /v1/subscriptions` endpoint. To subscribe, the subscriber's wallet talks to the `SubscriptionManager` contract directly. The backend learns about the new subscription only when the chain-listener observes the `Subscribed` event.
 
-- **Method**: `DELETE`
-- **Path**: `/v1/subscription-plans/:id`
-- **Auth**: `X-Api-Key`
-- **Description**: Hard-deletes the plan record. Returns `409` if any subscriptions on this plan
-  are in `active` or `past_due` status. In that case, use [UpdatePlan](#updateplan) with
-  `active: false` to stop new signups while letting existing subscriptions run out. Returns `404`
-  if the plan does not exist or belongs to a different merchant.
+### End-to-end flow
 
-### Parameters
+1. **Read the plan.** Fetch plan details with `GET /v1/plans/:id` (public). Use either the `pln_*` id or the `onChainPlanId`.
+2. **Read the contract address.** Look up the `SubscriptionManager` address for the plan's `chainId` via `GET /v1/config` (or hard-code from the [contracts page](../contracts.md)).
+3. **Approve the spend.** Have the subscriber sign `ERC20.approve(subscriptionManager, amount * cyclesYouWantToCover)`. The contract will pull `amount` per cycle until allowance is exhausted; then `ExpiredByFailure` fires.
+4. **Subscribe.** Have the subscriber sign `SubscriptionManager.subscribe(bytes32 planId)`. This emits `Subscribed(subId, planId, subscriber, anchorTime, anchorDay, serviceFeeBpsSnapshot)` and immediately performs the first charge (emitting `Charged`).
+5. **Wait for the listener.** The chain-listener inserts a row in `subscriptions` with `status='ACTIVE'`, `cyclesCharged=1`, and a computed `nextDueAt`. A `subscription.created` webhook fires, followed by `subscription.charged`.
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | string (path) | Yes | Plan ID. |
+### viem + wagmi pseudocode
 
-### Returns
+```ts
+import { useWriteContract, useReadContract } from "wagmi";
+import { erc20Abi, parseUnits } from "viem";
+import { subscriptionManagerAbi } from "./abi";
 
-```json
-{
-  "deleted": true
-}
+// 1. Fetch plan
+const plan = await fetch(`https://api.butterpay.io/v1/plans/${planId}`).then(r => r.json());
+
+// 2. SubscriptionManager address (e.g. from /v1/config or a constant)
+const subMgr = "0xSubscriptionManagerAddress";
+
+// 3. Approve enough allowance to cover N cycles up front
+const cyclesToCover = 12n;
+const totalAllowance = BigInt(plan.amount) * cyclesToCover;
+const approveHash = await writeContract({
+  abi: erc20Abi,
+  address: plan.tokenAddress,
+  functionName: "approve",
+  args: [subMgr, totalAllowance],
+});
+
+// 4. Subscribe (this also performs the first charge)
+const subHash = await writeContract({
+  abi: subscriptionManagerAbi,
+  address: subMgr,
+  functionName: "subscribe",
+  args: [plan.onChainPlanId],
+});
+
+// 5. Backend listener picks up `Subscribed` and inserts the subscription row.
+//    Poll GET /v1/subscriptions or listen for the subscription.created webhook.
 ```
 
-### Error responses
+### Why no API write?
 
-| Status | Error | Meaning |
-|--------|-------|---------|
-| 404 | `not found` | Plan does not exist or belongs to a different merchant. |
-| 409 | `Cannot delete: N active subscriber(s) still tied to this plan.` | Live subscribers exist. Deactivate the plan instead. |
-
-### Example
-
-**Request:**
-
-```bash
-curl -X DELETE https://api.butterpay.io/v1/subscription-plans/plan_01hwzq3k5n8ej4v2b7r9abc123 \
-  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
-```
-
-**Response** (HTTP 200):
-
-```json
-{
-  "deleted": true
-}
-```
-
----
-
-## RegisterSubscription
-
-Register a subscription that was just created on-chain. This is a **public** endpoint called by the
-hosted subscription page immediately after the subscriber signs the on-chain `subscribe()`
-transaction. It records the subscription in ButterPay and fires the `subscription.activated`
-webhook.
-
-- **Method**: `POST`
-- **Path**: `/v1/plans/:planId/subscribe`
-- **Auth**: Public
-- **Description**: Called after the subscriber has already approved `amountUsd × cycles` of the
-  plan's token to `SubscriptionManager.sol` and signed the `subscribe()` transaction on-chain. The
-  request must include the resulting on-chain subscription ID (`onChainId`) so the backend
-  scheduler can reference it for future charges. Returns `404` if the plan is inactive or not
-  found. On success the backend records the subscription, sets `cyclesCharged: 1` (the first charge
-  occurred in the `subscribe()` call), schedules the next charge at `now + intervalSeconds`, and
-  fires the `subscription.activated` webhook to the merchant.
-
-**Subscriber flow:**
-
-1. Fetch plan details via [GetPlan](#getplan) (public).
-2. Call `token.approve(subscriptionManagerAddress, amountUsd × cycles)` on-chain (one-time; the
-   allowance is consumed as charges occur).
-3. Call `subscriptionManager.subscribe(planOnChainId, ...)` — this executes the first charge
-   immediately and returns an `onChainId`.
-4. POST to this endpoint with the `onChainId` and `txHash`.
-
-Webhook events delivered after registration: `subscription.activated` (first charge),
-`subscription.charged` (each subsequent period), `subscription.charge_failed` (failed debit),
-`subscription.canceled` (on cancellation). See [Webhooks](../webhooks.md).
-
-### Parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `planId` | string | Yes | ButterPay plan ID. Must match the `:planId` path segment. |
-| `subscriberAddress` | string | Yes | Subscriber's wallet address. |
-| `onChainId` | number | Yes | Subscription ID returned by the `subscribe()` contract call. Used by the scheduler for future charges. |
-| `txHash` | string | No | Transaction hash of the `subscribe()` call, for on-chain reference. |
-
-### Returns
-
-```json
-{
-  "id": "sub_01hwzq3k5n8ej4v2b7r9abc456",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "planId": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-  "subscriberAddress": "0xSubscriberWalletAddress",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "amount": "9.99",
-  "interval": 2592000,
-  "cyclesTotal": 12,
-  "cyclesCharged": 1,
-  "onChainId": 42,
-  "status": "active",
-  "nextChargeAt": "2026-05-27T12:00:00.000Z",
-  "lastChargedAt": "2026-04-27T12:00:00.000Z",
-  "expiresAt": "2027-04-27T12:00:00.000Z",
-  "cancelledAt": null,
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-04-27T12:00:00.000Z"
-}
-```
-
-### Example
-
-**Request:**
-
-```bash
-curl -X POST https://api.butterpay.io/v1/plans/plan_01hwzq3k5n8ej4v2b7r9abc123/subscribe \
-  -H "Content-Type: application/json" \
-  -d '{
-    "planId": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-    "subscriberAddress": "0xSubscriberWalletAddress",
-    "onChainId": 42,
-    "txHash": "0xabc123..."
-  }'
-```
-
-**Response** (HTTP 201):
-
-```json
-{
-  "id": "sub_01hwzq3k5n8ej4v2b7r9abc456",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "planId": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-  "subscriberAddress": "0xSubscriberWalletAddress",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "amount": "9.99",
-  "interval": 2592000,
-  "cyclesTotal": 12,
-  "cyclesCharged": 1,
-  "onChainId": 42,
-  "status": "active",
-  "nextChargeAt": "2026-05-27T12:00:00.000Z",
-  "lastChargedAt": "2026-04-27T12:00:00.000Z",
-  "expiresAt": "2027-04-27T12:00:00.000Z",
-  "cancelledAt": null,
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-04-27T12:00:00.000Z"
-}
-```
-
----
-
-## CreateSubscription
-
-Create a subscription record directly via the merchant API, without going through the on-chain
-`subscribe()` flow. Intended for merchants who manage their own subscription pages or need to
-import existing subscribers.
-
-- **Method**: `POST`
-- **Path**: `/v1/subscriptions`
-- **Auth**: `X-Api-Key`
-- **Description**: Creates a subscription record scoped to the authenticated merchant. Unlike
-  [RegisterSubscription](#registersubscription), this endpoint does not require a `planId` —
-  billing parameters are specified explicitly in the request body. `onChainId` and `expiresAt` are
-  optional; if `onChainId` is omitted the scheduler will not attempt on-chain charges until it is
-  set. The `subscription.activated` webhook is fired on creation. Returns `400` if any required
-  field is missing.
-
-### Parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `subscriberAddress` | string | Yes | Subscriber's wallet address. |
-| `chain` | string | Yes | Blockchain identifier, e.g. `"arbitrum"`. |
-| `token` | string | Yes | Token symbol, e.g. `"USDT"`. |
-| `amount` | string | Yes | Decimal USD amount per cycle, e.g. `"9.99"`. |
-| `intervalSeconds` | number | Yes | Billing interval in seconds. |
-| `cyclesTotal` | number | Yes | Total number of billing cycles. |
-| `onChainId` | number | No | On-chain subscription ID. Required for the scheduler to execute charges. |
-| `expiresAt` | string | No | ISO 8601 datetime after which the subscription is considered complete. |
-
-### Returns
-
-The full subscription record (same shape as [RegisterSubscription](#registersubscription)).
-
-### Example
-
-**Request:**
-
-```bash
-curl -X POST https://api.butterpay.io/v1/subscriptions \
-  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..." \
-  -H "Content-Type: application/json" \
-  -d '{
-    "subscriberAddress": "0xSubscriberWalletAddress",
-    "chain": "arbitrum",
-    "token": "USDT",
-    "amount": "9.99",
-    "intervalSeconds": 2592000,
-    "cyclesTotal": 12,
-    "onChainId": 42,
-    "expiresAt": "2027-04-27T12:00:00.000Z"
-  }'
-```
-
-**Response** (HTTP 201):
-
-```json
-{
-  "id": "sub_01hwzq3k5n8ej4v2b7r9abc789",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "planId": null,
-  "subscriberAddress": "0xSubscriberWalletAddress",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "amount": "9.99",
-  "interval": 2592000,
-  "cyclesTotal": 12,
-  "cyclesCharged": 1,
-  "onChainId": 42,
-  "status": "active",
-  "nextChargeAt": "2026-05-27T12:00:00.000Z",
-  "lastChargedAt": "2026-04-27T12:00:00.000Z",
-  "expiresAt": "2027-04-27T12:00:00.000Z",
-  "cancelledAt": null,
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-04-27T12:00:00.000Z"
-}
-```
+Subscriber funds and authorisations live in the subscriber's wallet and the ERC-20 contract; ButterPay never custodies them. Forcing the subscribe call through the contract guarantees the backend cannot create or modify subscriptions out of band — every state change is rooted in an on-chain event.
 
 ---
 
 ## ListSubscriptions
 
-Return all subscriptions belonging to the authenticated merchant, ordered by creation date
-descending. Optionally filter by status.
+Returns every subscription whose `planId` belongs to a plan owned by the authenticated merchant. Optional `status` query filter.
 
 - **Method**: `GET`
 - **Path**: `/v1/subscriptions`
-- **Auth**: `X-Api-Key`
-- **Description**: Returns up to 100 subscriptions for the merchant. Use the `status` query
-  parameter to narrow results. Possible status values: `active`, `past_due`, `completed`,
-  `cancelled`.
+- **Auth**: Bearer JWT or `X-API-Key`
 
-### Parameters
+### Query parameters
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `status` | string (query) | No | Filter by subscription status. One of: `active`, `past_due`, `completed`, `cancelled`. |
+| Name | Type | Description |
+|------|------|-------------|
+| `status` | string | One of `ACTIVE`, `CANCELLED`, `EXPIRED_BY_FAILURE`, `INACTIVATED_BY_PLAN_CLOSED`. Omit for all. |
 
-### Returns
+### Response (HTTP 200)
 
 ```json
 {
   "data": [
     {
-      "id": "sub_01hwzq3k5n8ej4v2b7r9abc456",
-      "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-      "planId": "plan_01hwzq3k5n8ej4v2b7r9abc123",
+      "id": "sub_1a2b3c4d5e6f7g8h9i0j1k2l",
+      "planId": "pln_1a2b3c4d5e6f7g8h9i0j1k2l",
+      "onChainSubId": "42",
       "subscriberAddress": "0xSubscriberWalletAddress",
-      "chain": "arbitrum",
-      "token": "USDT",
-      "amount": "9.99",
-      "interval": 2592000,
-      "cyclesTotal": 12,
+      "anchorTime": "2026-04-27T12:00:00.000Z",
+      "anchorDay": 27,
       "cyclesCharged": 3,
-      "onChainId": 42,
-      "status": "active",
-      "nextChargeAt": "2026-07-27T12:00:00.000Z",
-      "lastChargedAt": "2026-06-27T12:00:00.000Z",
-      "expiresAt": "2027-04-27T12:00:00.000Z",
-      "cancelledAt": null,
-      "createdAt": "2026-04-27T12:00:00.000Z",
-      "updatedAt": "2026-06-27T12:00:00.000Z"
+      "serviceFeeBpsSnapshot": 80,
+      "status": "ACTIVE",
+      "nextDueAt": "2026-07-27T12:00:00.000Z",
+      "cancelReason": null,
+      "chainId": 42161,
+      "createdAt": "2026-04-27T12:00:30.000Z",
+      "updatedAt": "2026-06-27T12:00:30.000Z"
     }
   ],
   "count": 1
 }
 ```
 
-### Example
-
-**Request:**
+### curl
 
 ```bash
-curl "https://api.butterpay.io/v1/subscriptions?status=active" \
-  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
-```
-
-**Response** (HTTP 200):
-
-```json
-{
-  "data": [...],
-  "count": 5
-}
+curl "https://api.butterpay.io/v1/subscriptions?status=ACTIVE" \
+  -H "X-API-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
 ---
 
 ## GetSubscription
 
-Retrieve a single subscription by ID.
+Fetch a single subscription. Returns `404` if the subscription does not exist or its plan is not owned by the authenticated merchant.
 
 - **Method**: `GET`
 - **Path**: `/v1/subscriptions/:id`
-- **Auth**: `X-Api-Key`
-- **Description**: Returns the full subscription record. Returns `404` if the subscription does not
-  exist or belongs to a different merchant.
+- **Auth**: Bearer JWT or `X-API-Key`
 
-### Parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | string (path) | Yes | Subscription ID. |
-
-### Returns
-
-The full subscription record (same shape as [RegisterSubscription](#registersubscription)).
-
-### Example
-
-**Request:**
+### curl
 
 ```bash
-curl https://api.butterpay.io/v1/subscriptions/sub_01hwzq3k5n8ej4v2b7r9abc456 \
-  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
+curl https://api.butterpay.io/v1/subscriptions/sub_1a2b3c4d5e6f7g8h9i0j1k2l \
+  -H "X-API-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
-**Response** (HTTP 200):
+Response is a single subscription record (same shape as one element of [ListSubscriptions](#listsubscriptions) `data`).
+
+---
+
+## GetSubscriptionCharges
+
+Returns the on-chain charge history for a subscription, sourced from `chain_events` rows where `event_name='Charged'` and the `subId` arg matches.
+
+- **Method**: `GET`
+- **Path**: `/v1/subscriptions/:id/charges`
+- **Auth**: Bearer JWT or `X-API-Key`
+
+### Response (HTTP 200)
 
 ```json
 {
-  "id": "sub_01hwzq3k5n8ej4v2b7r9abc456",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "planId": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-  "subscriberAddress": "0xSubscriberWalletAddress",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "amount": "9.99",
-  "interval": 2592000,
-  "cyclesTotal": 12,
-  "cyclesCharged": 3,
-  "onChainId": 42,
-  "status": "active",
-  "nextChargeAt": "2026-07-27T12:00:00.000Z",
-  "lastChargedAt": "2026-06-27T12:00:00.000Z",
-  "expiresAt": "2027-04-27T12:00:00.000Z",
-  "cancelledAt": null,
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-06-27T12:00:00.000Z"
+  "data": [
+    {
+      "cycle": 3,
+      "txHash": "0xabc...",
+      "amount": "9990000",
+      "merchantNet": "9910080",
+      "serviceFee": "79920",
+      "chargedAt": "2026-06-27T12:00:14.000Z",
+      "blockNumber": 234567890
+    }
+  ],
+  "count": 1,
+  "cyclesTotal": 3
 }
+```
+
+| Field | Description |
+|-------|-------------|
+| `cycle` | The cycle number (`cyclesCharged` at the time of this charge). |
+| `txHash` | Transaction containing the `Charged` event. |
+| `amount` | Total token amount pulled from subscriber, in smallest units. |
+| `merchantNet` | Net amount delivered to the merchant after fees, smallest units. |
+| `serviceFee` | Service fee taken, smallest units. |
+| `chargedAt` | Time the listener processed the event. |
+| `cyclesTotal` | Current `subscriptions.cyclesCharged` (top-level, not per row). |
+
+### curl
+
+```bash
+curl https://api.butterpay.io/v1/subscriptions/sub_1a2b3c4d5e6f7g8h9i0j1k2l/charges \
+  -H "X-API-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
 ---
 
 ## CancelSubscription
 
-Cancel an active subscription. The subscription's status is set to `cancelled` and the
-`subscription.canceled` webhook is fired. No further charges are attempted by the scheduler.
+Builds an unsigned `merchantCancel(uint256 onChainSubId)` calldata blob. The merchant's wallet (which is the on-chain admin for the merchant) must sign and send. The backend does **not** mutate the subscription row; the chain-listener does that when `Cancelled` is observed.
 
 - **Method**: `POST`
 - **Path**: `/v1/subscriptions/:id/cancel`
-- **Auth**: `X-Api-Key`
-- **Description**: Cancels the subscription and records `cancelledAt`. Returns the updated
-  subscription record. Returns `404` if the subscription does not exist or belongs to a different
-  merchant. Note: cancelling via this endpoint updates the ButterPay record only. If the
-  subscriber's on-chain allowance remains, the on-chain subscription should also be cancelled via
-  `SubscriptionManager.sol` to prevent any future charges from the contract directly.
+- **Auth**: Bearer JWT or `X-API-Key`
 
-### Parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `id` | string (path) | Yes | Subscription ID. |
-
-### Returns
-
-The updated subscription record with `status: "cancelled"` and `cancelledAt` set.
+### Response (HTTP 200)
 
 ```json
 {
-  "id": "sub_01hwzq3k5n8ej4v2b7r9abc456",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "planId": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-  "subscriberAddress": "0xSubscriberWalletAddress",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "amount": "9.99",
-  "interval": 2592000,
-  "cyclesTotal": 12,
-  "cyclesCharged": 3,
-  "onChainId": 42,
-  "status": "cancelled",
-  "nextChargeAt": null,
-  "lastChargedAt": "2026-06-27T12:00:00.000Z",
-  "expiresAt": "2027-04-27T12:00:00.000Z",
-  "cancelledAt": "2026-07-01T09:00:00.000Z",
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-07-01T09:00:00.000Z"
+  "to": "0xSubscriptionManagerAddress",
+  "chainId": 42161,
+  "encodedTx": "0x...calldata...",
+  "onChainSubId": "42"
 }
 ```
 
-### Example
+### How the merchant signs
 
-**Request:**
+```ts
+const intent = await fetch(
+  `https://api.butterpay.io/v1/subscriptions/${subId}/cancel`,
+  { method: "POST", headers: { "X-API-Key": apiKey } },
+).then((r) => r.json());
+
+await wallet.sendTransaction({ to: intent.to, data: intent.encodedTx });
+```
+
+When the `Cancelled` event is observed, `applyCancelled` sets `status='CANCELLED'`, clears `nextDueAt`, and a `subscription.cancelled` webhook fires.
+
+### Subscriber-initiated cancel
+
+The subscriber can also cancel by calling `SubscriptionManager.subscriberCancel(uint256 subId)` directly, or by revoking the ERC-20 allowance (which triggers `ExpiredByFailure` on the next cycle). Both paths land in the same listener handlers and emit the corresponding webhook (`subscription.cancelled` or `subscription.expired`).
+
+### curl
 
 ```bash
-curl -X POST https://api.butterpay.io/v1/subscriptions/sub_01hwzq3k5n8ej4v2b7r9abc456/cancel \
-  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
+curl -X POST https://api.butterpay.io/v1/subscriptions/sub_1a2b3c4d5e6f7g8h9i0j1k2l/cancel \
+  -H "X-API-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
-**Response** (HTTP 200):
+---
 
-```json
-{
-  "id": "sub_01hwzq3k5n8ej4v2b7r9abc456",
-  "merchantId": "mer_01hwzq3k5n8ej4v2b7r9abc123",
-  "planId": "plan_01hwzq3k5n8ej4v2b7r9abc123",
-  "subscriberAddress": "0xSubscriberWalletAddress",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "amount": "9.99",
-  "interval": 2592000,
-  "cyclesTotal": 12,
-  "cyclesCharged": 3,
-  "onChainId": 42,
-  "status": "cancelled",
-  "nextChargeAt": null,
-  "lastChargedAt": "2026-06-27T12:00:00.000Z",
-  "expiresAt": "2027-04-27T12:00:00.000Z",
-  "cancelledAt": "2026-07-01T09:00:00.000Z",
-  "createdAt": "2026-04-27T12:00:00.000Z",
-  "updatedAt": "2026-07-01T09:00:00.000Z"
-}
-```
+## Webhooks fired
+
+All webhooks are dispatched by the chain-listener after it processes the corresponding event, never by the API request itself. See [Webhooks](../webhooks.md) for delivery semantics, signing, and full payload shapes.
+
+| Event | Source on chain | When |
+|-------|------------------|------|
+| `plan.created` | `PlanCreated` | Merchant's `createPlan()` tx confirms; row flips to `active=true`. |
+| `plan.deactivated` | `PlanActiveChanged(active=false)` | Merchant's `deactivatePlan()` tx confirms. |
+| `subscription.created` | `Subscribed` | Subscriber's `subscribe()` tx confirms; row inserted with `status='ACTIVE'`. |
+| `subscription.charged` | `Charged` | Each successful auto-charge cycle (including the first one inside `subscribe()`). |
+| `subscription.cancelled` | `Cancelled` | Either `merchantCancel()` or `subscriberCancel()` tx confirms. |
+| `subscription.expired` | `ExpiredByFailure` | The contract failed to pull funds (subscriber allowance/balance ran out). |
+| `subscription.resubscribed` | `Resubscribed` | A previously cancelled/expired subscriber re-subscribed; the existing row is reset (`cyclesCharged=0`, new anchor). |
+
+---
+
+## Field reference
+
+### Plan (`plans` table)
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | string | `pln_` + 24-char nanoid (lowercase alphanumeric). |
+| `merchantId` | string | FK → `merchants.id` (`mer_*`). |
+| `externalPlanCode` | string | 3–64 chars matching `^[a-z0-9_-]{3,64}$`. Unique per merchant. Acts as the salt input. |
+| `onChainPlanId` | string | `bytes32` hex. `keccak256(merchantOnChainId, salt)`. |
+| `tokenAddress` | string | EIP-55 checksummed ERC-20 address. |
+| `amount` | string | Token smallest units, decimal string. |
+| `monthsPerCycle` | integer | Cycle length in months, `1..12`. |
+| `bufferTimeSeconds` | integer | Grace period after `nextDueAt` before failure escalates. |
+| `metadataHash` | string | `keccak256(canonical-JSON(metadata))`. |
+| `active` | boolean | `false` until `PlanCreated` is observed; flipped to `false` on `PlanActiveChanged(false)`. |
+| `chainId` | integer | EVM chain id. |
+| `createdAt` | timestamp | Set when the intent row is inserted, before chain confirmation. |
+
+### Subscription (`subscriptions` table)
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | string | `sub_` + 24-char nanoid. |
+| `planId` | string | FK → `plans.id`. |
+| `onChainSubId` | string | `uint256` from `Subscribed`, stored as decimal string. Unique per `(chainId, onChainSubId)`. |
+| `subscriberAddress` | string | Wallet that signed `subscribe()`. |
+| `anchorTime` | timestamp | Time of the first successful charge. Cycle boundaries are computed from this. |
+| `anchorDay` | integer | Day-of-month of the anchor (`1..31`), used for monthly cadence on irregular months. |
+| `cyclesCharged` | integer | Increments on each `Charged` event. Reset to `0` on `Resubscribed`. |
+| `serviceFeeBpsSnapshot` | integer | Service fee bps captured at subscribe time. |
+| `status` | enum | One of `ACTIVE`, `CANCELLED`, `EXPIRED_BY_FAILURE`, `INACTIVATED_BY_PLAN_CLOSED`. |
+| `nextDueAt` | timestamp | Read from `SubscriptionManager.nextDueAt(subId)` after each event. `null` when not active. |
+| `cancelReason` | string | Free-form reason from the listener (`"merchant_cancel"`, `"subscriber_cancel"`, `"plan_closed"`, etc.). |
+| `chainId` | integer | EVM chain id. |
+| `createdAt` | timestamp | Set when the listener inserts the row. |
+| `updatedAt` | timestamp | Touched on each event. |
 
 ---
 
@@ -759,4 +515,5 @@ curl -X POST https://api.butterpay.io/v1/subscriptions/sub_01hwzq3k5n8ej4v2b7r9a
 
 - [Authentication](../authentication.md)
 - [Webhooks](../webhooks.md)
+- [Contracts & addresses](../contracts.md)
 - [Invoices API](invoices.md)

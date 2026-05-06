@@ -11,7 +11,6 @@ obtained, how to use it, and when to prefer one over another.
 |------|-------------------|----------|----------|
 | Bearer JWT | `Authorization: Bearer <token>` | Dashboard sessions, API access | 24 h |
 | API key | `X-Api-Key: <key>` | Server-to-server requests | Until rotated |
-| sessionToken | Request body field | Payment-page transaction submission | 30 min |
 
 Most server integrations use the API key exclusively after the initial setup. Bearer JWTs are
 primarily used during onboarding (configuring addresses, generating the API key) and for
@@ -163,38 +162,6 @@ curl -X POST https://api.butterpay.io/v1/merchants/me/rotate-key \
 
 Store the new key exactly as you stored the original. The previous key no longer authenticates
 from this point.
-
----
-
-## sessionToken (payment page only)
-
-The sessionToken is a short-lived JWT issued by the hosted payment page when a customer
-connects their wallet. It binds a specific `(invoiceId, payerAddress)` pair, preventing a
-third party from submitting a transaction for an invoice using a different payer address.
-
-`POST /v1/invoices/:id/session` issues the token. The request is unauthenticated (public
-endpoint) and rate-limited to 20 requests per minute per IP.
-
-```bash
-curl -X POST https://api.butterpay.io/v1/invoices/inv_01hwz4m8y3g9c5d7f8h0j2kn/session \
-  -H "Content-Type: application/json" \
-  -d '{ "payerAddress": "0xCustomerWalletAddress" }'
-```
-
-**Response**
-
-```json
-{
-  "sessionToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-}
-```
-
-The token expires 30 minutes after issuance. It must be included in the body of
-`POST /v1/invoices/:id/tx` to submit an on-chain transaction.
-
-In practice this flow is handled entirely by the ButterPay hosted payment page
-(`pay.butterpay.io/pay/<id>`). Most merchants do not need to implement it unless they are
-building a custom payment UI.
 
 ---
 

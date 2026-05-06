@@ -11,9 +11,10 @@
 
 ## API Reference
 
-* [Invoices](api/invoices.md)
+* [Config](api/config.md)
 * [Merchants](api/merchants.md)
 * [Plans & Subscriptions](api/plans-subscriptions.md)
+* [Invoices](api/invoices.md)
 * [Webhooks Management](api/webhooks.md)
 
 ## SDK

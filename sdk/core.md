@@ -1,503 +1,30 @@
 # @butterpay/core
 
-Low-level TypeScript SDK: wallet adapters, payment providers, API client. Use this directly for
-full control, or build on top of `@butterpay/react` (planned).
+Low-level TypeScript SDK for the ButterPay V2 API: a typed REST client, intent
+helpers for non-custodial on-chain writes, wallet adapters, and balance scanning.
 
-The package exposes three layers you can use independently or together:
+The V2 contract model is **non-custodial**. The merchant's wallet — not the
+ButterPay backend — signs the on-chain calls that register merchants, create
+plans, and cancel subscriptions. Endpoints that trigger a chain write return an
+`encodedTx` (ABI-encoded calldata) plus a destination `to` and `chainId` for the
+merchant wallet to broadcast.
 
-- **Wallet layer** — `ExternalWalletAdapter` (browser/MetaMask) and `HDWalletAdapter`
-  (server/TG bot, Phase 2).
-- **Payment layer** — `CryptoPaymentProvider` for one-time stablecoin payments,
-  `SubscriptionProvider` for on-chain recurring charges.
-- **API layer** — `ApiClient`, a fetch-based HTTP client for the ButterPay backend.
-
-The `ButterPay` class wires all three together so most integrations need only a single import.
+This page documents `@butterpay/core@0.3.0`.
 
 ---
 
-## Installation
+## Install
 
-`@butterpay/core` is not yet published to npm. Reference it from the SDK monorepo directly:
-
-```jsonc
-// package.json
-{
-  "dependencies": {
-    "@butterpay/core": "file:../butter-pay-sdk/core"
-  }
-}
+```bash
+npm install @butterpay/core viem
 ```
 
-Peer dependency: `viem ^2.47.10`.
+`viem ^2.47.10` is a peer-level dependency used by the wallet adapters and is
+recommended for executing intents on the merchant side.
 
 ---
 
-## Quickstart
-
-```ts
-import { ButterPay, ExternalWalletAdapter } from "@butterpay/core";
-
-const sdk = new ButterPay({
-  apiUrl: "https://api.butterpay.io",
-  wallet: new ExternalWalletAdapter(window.ethereum),
-});
-
-await sdk.connect();
-const balances = await sdk.scanBalances();
-
-const { invoice, txHash } = await sdk.pay({
-  amount: "49.99",
-  token: "USDC",
-  chain: "arbitrum",
-  merchantAddress: "0xYourReceivingAddress",
-  paymentRouterAddress: "0x4b32bcd3eC4F0a14D7061e0d239eBAd84F77743f",
-  serviceFeeBps: 80,
-  description: "Order #1234",
-  merchantOrderId: "order-001",
-  waitForConfirmation: true,
-});
-
-console.log(invoice.status); // "confirmed"
-console.log(txHash);         // "0xabc..."
-```
-
-`sdk.pay()` internally runs the full five-step flow: create invoice → get session token → approve
-token → call `PaymentRouter.pay()` → submit txHash to backend for tracking.
-
----
-
-## Configuration
-
-Pass a `ButterPayConfig` object to the `ButterPay` constructor.
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `apiUrl` | `string` | Yes | ButterPay API base URL, e.g. `"https://api.butterpay.io"`. |
-| `apiKey` | `string` | No | Merchant API key (`bp_...`). Required for merchant-only endpoints (create plan, list subscriptions, etc.). Omit for payer-side usage. |
-| `wallet` | `WalletAdapter` | Yes | Wallet adapter instance. Pass `ExternalWalletAdapter` for browser usage or `HDWalletAdapter` for server/TG bot (Phase 2). |
-| `chains` | `Partial<Record<ChainName, Partial<ChainConfig>>>` | No | Per-chain overrides for RPC URLs, contract addresses, or token lists. Merged on top of `defaultChainConfigs`. See [Custom chain configuration](#custom-chain-configuration). |
-
----
-
-## Wallet adapters
-
-| Adapter | Use case | Status |
-|---------|----------|--------|
-| `ExternalWalletAdapter` | Browser wallet (MetaMask, OKX, Rabby, any EIP-1193) | Stable |
-| `HDWalletAdapter` | Server-side or Telegram Mini App self-custody | Phase 2 |
-
-### ExternalWalletAdapter
-
-Wraps any EIP-1193 provider. Pass `window.ethereum` or any compatible injected provider.
-
-```ts
-import { ExternalWalletAdapter } from "@butterpay/core";
-
-const wallet = new ExternalWalletAdapter(window.ethereum);
-
-// Use with ButterPay
-const sdk = new ButterPay({
-  apiUrl: "https://api.butterpay.io",
-  wallet,
-});
-
-// Or use standalone
-const address = await wallet.connect();
-console.log(address); // "0xAbCd..."
-```
-
-The adapter calls `eth_requestAccounts` on `connect()` and `eth_sendTransaction` for on-chain
-interactions. It does not implement `signTypedData` — EIP-712 is handled at the provider level by
-`CryptoPaymentProvider` when constructing permit signatures.
-
-### HDWalletAdapter (Phase 2)
-
-For environments without an injected wallet — such as Node.js backends and Telegram Mini App
-WebViews — `HDWalletAdapter` creates or restores a BIP39/BIP44 HD wallet in-process.
-
-Three construction paths are provided: `HDWalletAdapter.create()` (fresh mnemonic),
-`HDWalletAdapter.fromMnemonic(mnemonic)` (import), and `HDWalletAdapter.fromPrivateKey(key)`.
-Keystores can be encrypted and decrypted with `encryptToKeystore` / `HDWalletAdapter.fromKeystore`
-using PBKDF2 + AES-256-GCM.
-
-Full coverage of `HDWalletAdapter` is deferred to a Phase 2 update. See the
-[Types reference — HDWalletConfig / Keystore](#hdwalletconfig) below for the relevant type shapes.
-
----
-
-## API methods
-
-All public methods on the `ButterPay` class are listed below, grouped by domain. Every method is
-async unless noted.
-
-### Wallet
-
-| Method | Signature | Returns | Description |
-|--------|-----------|---------|-------------|
-| `connect` | `connect()` | `Promise<Address>` | Trigger wallet connection (calls `eth_requestAccounts` on `ExternalWalletAdapter`). Returns the active EVM address. Throws if the user rejects or no accounts are returned. |
-| `getAddress` | `getAddress()` | `Address \| null` | Return the currently connected address without triggering any wallet prompt. Returns `null` if the wallet has not been connected yet. (Synchronous.) |
-| `scanBalances` | `scanBalances()` | `Promise<BalanceInfo[]>` | Scan USDT and USDC balances for the connected address across all configured chains in parallel. Throws if the wallet is not connected. |
-
-### Payments
-
-| Method | Signature | Returns | Description |
-|--------|-----------|---------|-------------|
-| `pay` | `pay(params)` | `Promise<{ invoice: Invoice; txHash: Hash }>` | Full one-time payment flow. Creates an invoice, obtains a session token, approves the token if needed, calls `PaymentRouter.pay()`, submits the txHash, and optionally polls for on-chain confirmation. See parameter table below. |
-| `getInvoice` | `getInvoice(invoiceId: string)` | `Promise<Invoice>` | Fetch an invoice by ID. Delegates to `ApiClient.getInvoice`. |
-| `waitForConfirmation` | `waitForConfirmation(invoiceId: string)` | `Promise<Invoice>` | Poll the API every 5 seconds (up to 5 minutes) until the invoice reaches a terminal status (`"confirmed"` or `"failed"`). Throws on timeout. |
-
-#### `pay()` parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `amount` | `string` | Yes | Human-readable USD amount, e.g. `"49.99"`. |
-| `token` | `string` | Yes | Token symbol: `"USDT"` or `"USDC"`. |
-| `chain` | `ChainName` | Yes | Target chain: `"arbitrum"`, `"ethereum"`, `"bsc"`, `"polygon"`, or `"arbitrumSepolia"`. |
-| `merchantAddress` | `Address` | Yes | Merchant receiving wallet address (EVM `0x...`). |
-| `paymentRouterAddress` | `Address` | Yes | Deployed `PaymentRouter` contract address on the target chain. |
-| `serviceFeeBps` | `number` | Yes | Service fee in basis points, e.g. `80` for 0.8%. |
-| `referrer` | `Address` | No | Referrer address for referral fee split. |
-| `referrerFeeBps` | `number` | No | Referrer fee in basis points. |
-| `description` | `string` | No | Human-readable description stored on the invoice. |
-| `merchantOrderId` | `string` | No | Your internal order ID. Returned in webhooks for reconciliation. |
-| `metadata` | `Record<string, unknown>` | No | Arbitrary key-value pairs stored on the invoice. |
-| `waitForConfirmation` | `boolean` | No | If `true`, polls the API until the invoice is confirmed or failed before resolving. Defaults to `false`. |
-
-### Subscription plans (merchant)
-
-These methods require `apiKey` in the `ButterPayConfig`.
-
-| Method | Signature | Returns | Description |
-|--------|-----------|---------|-------------|
-| `createPlan` | `createPlan(params)` | `Promise<Plan>` | Create a new subscription plan. `params` accepts `name`, `amountUsd`, `intervalSeconds`, `cycles`, `chain?`, `token?`, `description?`. Requires `apiKey`. |
-| `listPlans` | `listPlans()` | `Promise<Plan[]>` | List all active plans for the authenticated merchant. |
-| `getPlan` | `getPlan(planId: string)` | `Promise<Plan>` | Fetch a plan by ID. Public endpoint — no `apiKey` required. Used by the `/subscribe/[planId]` page to display plan details. |
-| `updatePlan` | `updatePlan(planId: string, updates)` | `Promise<Plan>` | Partially update a plan. Accepted fields: `name`, `description`, `active`. To stop new subscribers without deleting, set `active: false`. |
-| `deletePlan` | `deletePlan(planId: string)` | `Promise<{ deleted: boolean }>` | Permanently delete a plan. Rejected with an error if the plan has live subscribers — use `updatePlan({ active: false })` instead. |
-
-### Subscriptions (user flow)
-
-| Method | Signature | Returns | Description |
-|--------|-----------|---------|-------------|
-| `subscribe` | `subscribe(params)` | `Promise<SubscribeResult>` | Full subscribe flow: fetch plan (unless pre-supplied) → approve `amount × cycles` on-chain → call `SubscriptionManager.subscribe()` → register with backend. Returns txHashes, on-chain subscription ID, and the persisted `Subscription` record. Wallet must be connected. |
-| `listSubscriptions` | `listSubscriptions(status?: string)` | `Promise<Subscription[]>` | List subscriptions for the authenticated merchant. Pass a `status` string to filter (`"active"`, `"cancelled"`, etc.). Requires `apiKey`. |
-| `getSubscription` | `getSubscription(id: string)` | `Promise<Subscription>` | Fetch a single subscription by ID. |
-| `cancelSubscription` | `cancelSubscription(id, opts?)` | `Promise<{ subscription: Subscription; cancelTxHash?: Hash }>` | Cancel a subscription. By default performs both an on-chain `SubscriptionManager.cancel()` call and a backend status update. Pass `{ apiOnly: true }` to only update the backend record (e.g., from the merchant Dashboard where no wallet is connected). |
-
-#### `subscribe()` parameters
-
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `planId` | `string` | Yes | ID of the plan to subscribe to. |
-| `plan` | `Plan` | No | Pre-fetched plan object. If omitted, the SDK fetches it automatically. |
-| `subscriptionManagerAddress` | `Address` | No | Override the `SubscriptionManager` contract address. Defaults to the address in `ChainConfig` for the plan's chain. |
-| `expiry` | `number` | No | Unix timestamp after which the subscription expires. `0` means no expiry. Defaults to `now + intervalSeconds × cycles`. |
-
----
-
-## Types reference
-
-Types are exported from `@butterpay/core` and originate in `src/types.ts`.
-
-### Chains
-
-#### ChainName
-
-```ts
-type ChainName = "ethereum" | "arbitrum" | "bsc" | "polygon" | "arbitrumSepolia";
-```
-
-#### ChainConfig
-
-```ts
-interface ChainConfig {
-  name: ChainName;
-  viemChain: ViemChain;           // from viem — chain definition object
-  rpcUrl: string;                 // public RPC endpoint
-  paymentRouterAddress: Address;  // deployed PaymentRouter contract
-  subscriptionManagerAddress?: Address; // deployed SubscriptionManager (zero if not deployed)
-  tokens: TokenConfig[];          // supported stablecoins on this chain
-  blockExplorerUrl: string;       // e.g. "https://arbiscan.io"
-}
-```
-
-#### TokenConfig
-
-```ts
-interface TokenConfig {
-  symbol: string;   // e.g. "USDT"
-  address: Address; // ERC20 contract address
-  decimals: number; // e.g. 6
-}
-```
-
-### Wallet
-
-#### WalletAdapter
-
-The interface implemented by both `ExternalWalletAdapter` and `HDWalletAdapter`.
-
-```ts
-interface WalletAdapter {
-  /** Connect/unlock the wallet, return the active address */
-  connect(): Promise<Address>;
-
-  /** Disconnect/lock */
-  disconnect(): Promise<void>;
-
-  /** Get connected address, null if not connected */
-  getAddress(): Address | null;
-
-  /** Check if connected */
-  isConnected(): boolean;
-
-  /** Sign and send a transaction, return tx hash */
-  sendTransaction(tx: TransactionRequest): Promise<Hash>;
-
-  /** Sign typed data (EIP-712) — optional */
-  signTypedData?(params: SignTypedDataParams): Promise<Hash>;
-
-  /** Adapter type identifier */
-  readonly type: "hd" | "walletconnect" | "tonconnect" | "external";
-}
-```
-
-#### TransactionRequest
-
-```ts
-interface TransactionRequest {
-  to: Address;
-  data?: `0x${string}`;
-  value?: bigint;
-  chainId?: number;
-  gas?: bigint;
-}
-```
-
-### Payment
-
-#### PaymentMethod
-
-```ts
-type PaymentMethod = "crypto" | "fiat";
-```
-
-#### PayParams
-
-Parameters passed to `CryptoPaymentProvider.pay()` (the low-level provider, not `ButterPay.pay()`).
-
-```ts
-interface PayParams {
-  invoiceId: string;
-  chain: ChainName;
-  token: string;
-  amount: string;                       // human-readable decimal
-  merchantAddress: Address;
-  paymentRouterAddress: Address;
-  invoiceIdBytes32: `0x${string}`;      // keccak256(invoiceId) — bytes32 for contract
-  serviceFeeBps: number;
-  referrer?: Address;
-  referrerFeeBps?: number;
-  deadline: number;                     // unix timestamp (30-min window typical)
-}
-```
-
-#### PayResult
-
-```ts
-interface PayResult {
-  txHash: Hash;
-  chain: ChainName;
-  status: "submitted" | "confirmed" | "failed";
-}
-```
-
-### API objects
-
-#### Invoice
-
-```ts
-interface Invoice {
-  id: string;
-  merchantId: string;
-  merchantName?: string;
-  merchantOrderId?: string;
-  merchantReceivingAddresses?: Record<string, string>;
-  amount: string;           // decimal string, e.g. "49.990000000000000000"
-  token: string;            // e.g. "USDT"
-  chain: string;            // e.g. "arbitrum"
-  status: string;           // "created" | "initiated" | "confirmed" | "failed" | "expired" | "refunded"
-  paymentMethod?: string;
-  payerAddress?: string;
-  txHash?: string;
-  serviceFee?: string;
-  merchantReceived?: string;
-  description?: string;
-  expiresAt?: string;       // ISO 8601
-  redirectUrl?: string;
-  createdAt: string;        // ISO 8601
-}
-```
-
-#### BalanceInfo
-
-```ts
-interface BalanceInfo {
-  chain: ChainName;
-  token: string;        // e.g. "USDT"
-  balance: string;      // human-readable decimal, e.g. "100.500000"
-  rawBalance: bigint;   // on-chain raw value (before dividing by decimals)
-}
-```
-
-### Subscriptions
-
-#### Plan
-
-```ts
-interface Plan {
-  id: string;
-  merchantId: string;
-  merchantName?: string;
-  merchantReceivingAddresses?: Record<string, string>;
-  name: string;
-  description?: string;
-  amountUsd: string;    // decimal string, e.g. "9.99"
-  interval: number;     // billing interval in seconds, e.g. 2592000 (30 days)
-  cycles: number;       // total number of billing cycles
-  chain: string;
-  token: string;
-  active: boolean;
-  createdAt: string;    // ISO 8601
-  updatedAt?: string;   // ISO 8601
-}
-```
-
-#### Subscription
-
-```ts
-interface Subscription {
-  id: string;
-  merchantId: string;
-  planId?: string;
-  subscriberAddress: string;
-  chain: string;
-  token: string;
-  amount: string;         // per-cycle amount, decimal string
-  interval: number;       // seconds between charges
-  cyclesTotal: number;
-  cyclesCharged: number;
-  onChainId?: number;     // ID in the SubscriptionManager contract
-  status: "active" | "cancelled" | "expired" | "completed" | "past_due";
-  nextChargeAt?: string;  // ISO 8601
-  lastChargedAt?: string; // ISO 8601
-  expiresAt?: string;     // ISO 8601
-  cancelledAt?: string;   // ISO 8601
-  createdAt: string;      // ISO 8601
-}
-```
-
-#### SubscribeParams
-
-Parameters for `SubscriptionProvider.subscribe()` (the low-level provider, not `ButterPay.subscribe()`).
-
-```ts
-interface SubscribeParams {
-  plan: Plan;
-  subscriberAddress: Address;           // must match connected wallet
-  subscriptionManagerAddress: Address;  // SubscriptionManager contract on the plan's chain
-  expiry?: number;                      // unix timestamp; 0 = no expiry
-}
-```
-
-#### SubscribeResult
-
-Returned by both `ButterPay.subscribe()` and `SubscriptionProvider.subscribe()`.
-
-```ts
-interface SubscribeResult {
-  subscription: Subscription;   // persisted backend record
-  onChainId: number;            // ID in the SubscriptionManager contract
-  approveTxHash?: Hash;         // undefined if allowance was already sufficient
-  subscribeTxHash: Hash;        // on-chain subscribe() tx
-  chain: ChainName;
-}
-```
-
-### HD wallet
-
-#### HDWalletConfig
-
-```ts
-interface HDWalletConfig {
-  password?: string;   // password for encrypting the keystore
-  mnemonic?: string;   // pre-existing BIP39 mnemonic to import
-}
-```
-
-#### Keystore
-
-Encrypted wallet backup produced by `HDWalletAdapter.encryptToKeystore()`.
-
-```ts
-interface Keystore {
-  ciphertext: string;  // AES-256-GCM encrypted mnemonic (hex)
-  salt: string;        // PBKDF2 salt (hex)
-  iv: string;          // AES-GCM IV (hex)
-  version: number;     // format version — currently 1
-}
-```
-
----
-
-## Custom chain configuration
-
-Pass a `chains` override map to the `ButterPay` constructor to replace RPC endpoints, contract
-addresses, or token lists for any chain. This is the primary mechanism for pointing the SDK at a
-testnet or a self-deployed set of contracts.
-
-```ts
-import { ButterPay, ExternalWalletAdapter, defaultChainConfigs } from "@butterpay/core";
-
-const sdk = new ButterPay({
-  apiUrl: "http://localhost:3000",
-  wallet: new ExternalWalletAdapter(window.ethereum),
-  chains: {
-    // Override arbitrum to use testnet contracts
-    arbitrum: {
-      rpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-      paymentRouterAddress: "0x2bb7f9678c6FC1F2538172F5621087a9D44F9D63",
-      subscriptionManagerAddress: "0x51Aaf344ee7b3d35e8347afbDA777e45c7441cd6",
-      tokens: [
-        { symbol: "USDT", address: "0x536BB419E953eC88f92f6fB23b9331071BF127db", decimals: 6 },
-        { symbol: "USDC", address: "0xb8BC61289E64db67b7AC5887406dEf512Ec36A81", decimals: 6 },
-      ],
-    },
-  },
-});
-```
-
-Overrides are merged shallowly — only the keys you provide replace the defaults from
-`defaultChainConfigs`. Unspecified fields (e.g., `viemChain`, `blockExplorerUrl`) retain their
-default values.
-
-To inspect or extend the defaults directly:
-
-```ts
-import { defaultChainConfigs } from "@butterpay/core";
-
-// defaultChainConfigs is a Record<ChainName, ChainConfig>
-// Chains: ethereum, arbitrum, bsc, polygon, arbitrumSepolia
-console.log(defaultChainConfigs.arbitrum.paymentRouterAddress);
-// → "0x4b32bcd3eC4F0a14D7061e0d239eBAd84F77743f"
-```
-
----
-
-## Server-side usage
-
-On the server, use `ApiClient` directly — no wallet or on-chain interaction is needed. Pass
-`apiKey` to authenticate merchant-only endpoints.
+## Quick start
 
 ```ts
 import { ApiClient } from "@butterpay/core";
@@ -507,57 +34,495 @@ const api = new ApiClient({
   apiKey: process.env.BUTTERPAY_API_KEY,
 });
 
-// Create an invoice; redirect the user to the hosted payment page
-const invoice = await api.createInvoice({
-  amountUsd: "49.99",
-  merchantOrderId: "order-001",
-  description: "Pro plan — monthly",
-  redirectUrl: "https://your-site.example.com/thank-you",
-  webhookUrl: "https://your-site.example.com/webhooks/butterpay",
+const { id, payUrl } = await api.invoices.create({
+  amountUsd: "19.99",
+  merchantOrderId: "order-123",
 });
 
-const payUrl = `https://pay.butterpay.io/pay/${invoice.id}`;
+console.log(`Send your customer to: ${payUrl}`);
 ```
 
-You can also use `ButterPay` on the server by passing a no-op stub as the wallet and relying on
-`apiKey` for authentication. However, for pure server-side work, instantiating `ApiClient`
-directly is simpler and avoids the dependency on a wallet adapter.
+`ApiClient` is the only entrypoint you need for invoice issuance and read-side
+queries. Chain-write operations (registration, plan creation, cancel) return
+intents that you sign with a wallet — see [Intent flow](#intent-flow).
 
-### Managing plans and subscriptions server-side
+---
 
-```ts
-// Create a recurring plan
-const plan = await api.createPlan({
-  name: "Premium Monthly",
-  amountUsd: "9.99",
-  intervalSeconds: 30 * 24 * 60 * 60, // 30 days
-  cycles: 12,
-  chain: "arbitrum",
-  token: "USDT",
-});
+## API surface
 
-const subscribeUrl = `https://pay.butterpay.io/subscribe/${plan.id}`;
+`new ApiClient(config)` exposes four namespaces, mirroring the V2 backend route
+files.
 
-// Fetch subscribers
-const subscribers = await api.listSubscriptions("active");
+| Namespace | Purpose |
+|---|---|
+| `api.merchants` | Build a registration intent for the merchant wallet to sign. |
+| `api.plans` | Create / list / fetch subscription plans. Create returns an intent. |
+| `api.subscriptions` | List / fetch subscriptions, build merchant-side cancel intents. |
+| `api.invoices` | Create one-time invoices and fetch their status. |
 
-// Pause a plan (stop new sign-ups without deleting)
-await api.updatePlan(plan.id, { active: false });
-```
-
-### ApiClient constructor
+### Constructor
 
 ```ts
 import { ApiClient, type ApiClientConfig } from "@butterpay/core";
 
 const api = new ApiClient({
-  baseUrl: "https://api.butterpay.io",  // required
-  apiKey: "bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...",               // optional; adds X-Api-Key header to every request
+  baseUrl: "https://api.butterpay.io", // required
+  apiKey: "bp_xxxxxxxxxxxxxxxxxxxxxxxx", // optional; required for write & list endpoints
 });
 ```
 
-The client sends `X-Api-Key: <apiKey>` on every request when `apiKey` is set. Errors from the
-API surface as thrown `Error` instances with the server-provided message.
+The client sends `X-API-Key: <apiKey>` on every request when set. Errors
+surface as thrown `Error` instances carrying the server-provided message. The
+`api.invoices.get()` and `api.plans.get()` endpoints are public and do not
+require an API key.
+
+---
+
+## `api.merchants`
+
+### `createRegistrationIntent(params)`
+
+Build a `registerMerchant()` intent. The merchant's wallet signs and broadcasts
+`encodedTx` against `SubscriptionManager`. The chain listener observes
+`MerchantRegistered` and fires the `merchant.registered` webhook.
+
+```ts
+async createRegistrationIntent(params: {
+  receiverAddress: string;
+  metadata: Record<string, unknown>;
+  chainId: number;
+}): Promise<MerchantRegistrationIntent>
+```
+
+Returns `MerchantRegistrationIntent`:
+
+```ts
+interface MerchantRegistrationIntent {
+  metadataHash: `0x${string}`; // keccak256 of canonical metadata JSON
+  metadataJson: string;        // canonical JSON string stored off-chain
+  encodedTx: `0x${string}`;    // calldata for SubscriptionManager.registerMerchant(...)
+}
+```
+
+Example:
+
+```ts
+const intent = await api.merchants.createRegistrationIntent({
+  receiverAddress: "0xMerchantReceiver...",
+  metadata: { name: "Acme Inc.", website: "https://acme.example" },
+  chainId: 42161,
+});
+
+// Hand `intent.encodedTx` to the merchant wallet — see Intent flow below.
+```
+
+---
+
+## `api.plans`
+
+### `create(params)`
+
+Build a `createPlan()` intent. `externalPlanCode` is the merchant-chosen
+identifier (`^[a-z0-9_-]{3,64}$`) and is unique per merchant; it becomes the
+salt (keccak256 of the code). `amount` is in the smallest unit of
+`tokenAddress` — for USDC (6 decimals), `"10000000"` is 10 USDC.
+
+```ts
+async create(params: {
+  externalPlanCode: string;
+  tokenAddress: string;
+  amount: string;
+  monthsPerCycle: number;
+  bufferTimeSeconds: number;
+  metadata?: Record<string, unknown>;
+  chainId: number;
+}): Promise<PlanIntent>
+```
+
+Returns `PlanIntent`:
+
+```ts
+interface PlanIntent {
+  planId: `0x${string}`;       // pre-computed bytes32 on-chain plan id
+  salt: `0x${string}`;         // keccak256(externalPlanCode)
+  metadataHash: `0x${string}`; // keccak256 of canonical metadata JSON
+  encodedTx: `0x${string}`;    // calldata for SubscriptionManager.createPlan(...)
+}
+```
+
+After signing, the `plan.created` webhook fires once the listener observes
+`PlanCreated` and flips `active=true`.
+
+Example:
+
+```ts
+const intent = await api.plans.create({
+  externalPlanCode: "premium-monthly",
+  tokenAddress: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", // USDC on Arbitrum
+  amount: "9990000", // 9.99 USDC (6 decimals)
+  monthsPerCycle: 1,
+  bufferTimeSeconds: 86_400,
+  chainId: 42161,
+});
+```
+
+### `list()` and `get(idOrOnChainId)`
+
+```ts
+async list(): Promise<{ data: Plan[]; count: number }>
+async get(idOrOnChainId: string): Promise<Plan>
+```
+
+`list()` returns plans owned by the authenticated merchant. `get()` accepts
+either the DB id (`pln_…`) or the on-chain plan id (bytes32 hex) and is a
+public endpoint — no API key required.
+
+```ts
+const { data: plans, count } = await api.plans.list();
+const plan = await api.plans.get("pln_01HXY…");
+```
+
+---
+
+## `api.subscriptions`
+
+Subscription **creation** is non-custodial and happens entirely on-chain — the
+subscriber's wallet calls `SubscriptionManager.subscribe(planId)` directly.
+The SDK only reads subscriptions and helps merchants cancel.
+
+### `list(params?)` and `get(id)`
+
+```ts
+async list(params?: { status?: string }): Promise<{ data: Subscription[]; count: number }>
+async get(id: string): Promise<Subscription>
+```
+
+```ts
+const { data: active } = await api.subscriptions.list({ status: "active" });
+const sub = await api.subscriptions.get("sub_01HXY…");
+```
+
+### `cancelIntent(id)`
+
+Build a `merchantCancel()` intent. The merchant wallet signs and broadcasts
+`encodedTx`; the listener picks up the `Cancelled` event, flips DB status, and
+delivers a `subscription.cancelled` webhook with `cancelledBy: "merchant"`.
+
+```ts
+async cancelIntent(id: string): Promise<CancelIntent>
+```
+
+Returns `CancelIntent`:
+
+```ts
+interface CancelIntent {
+  encodedTx: `0x${string}`; // calldata for SubscriptionManager.merchantCancel(onChainSubId)
+  onChainSubId: string;     // uint256 on-chain subscription id (string for safety)
+  chainId: number;
+}
+```
+
+```ts
+const intent = await api.subscriptions.cancelIntent("sub_01HXY…");
+await wallet.sendTransaction({
+  to: SUBSCRIPTION_MANAGER_ADDRESS,
+  data: intent.encodedTx,
+  chainId: intent.chainId,
+});
+```
+
+---
+
+## `api.invoices`
+
+### `create(params)`
+
+Create a one-time invoice. The merchant shares `payUrl` with the user, who
+pays via PayRouter on-chain — no further SDK interaction required. Backend
+listens for `Paid` and fires `payment.confirmed` (or `payment.expired` after
+the deadline).
+
+```ts
+async create(params: {
+  amountUsd: string;
+  merchantOrderId?: string;
+  tokenAddress?: string;
+  referrerAddress?: string;
+  referrerFeeBps?: number;
+  description?: string;
+}): Promise<InvoiceCreated>
+```
+
+`amountUsd` is a USD-denominated decimal string (e.g. `"19.99"`). Setting
+`tokenAddress` restricts payment to a single ERC20; omit to allow any
+whitelisted token.
+
+Returns `InvoiceCreated`:
+
+```ts
+interface InvoiceCreated {
+  id: string;                          // DB id, e.g. "inv_01HXY…"
+  onChainInvoiceId: `0x${string}`;     // bytes32 used on-chain
+  amountUsd: string;
+  status: string;                      // PENDING at creation
+  merchantOrderId: string | null;
+  description: string | null;
+  createdAt: string;                   // ISO 8601
+  payUrl: string;                      // hosted checkout — share with the customer
+  /** @deprecated renamed in 0.2.0; use `onChainInvoiceId` */
+  invoiceId?: `0x${string}`;
+}
+```
+
+Example:
+
+```ts
+const invoice = await api.invoices.create({
+  amountUsd: "49.99",
+  merchantOrderId: "order-001",
+  description: "Pro plan — monthly",
+});
+
+// Redirect the customer:
+res.redirect(invoice.payUrl);
+```
+
+### `get(idOrOnChainId)`
+
+Fetch an invoice by DB id (`inv_…`) or on-chain bytes32 id. Public endpoint.
+
+```ts
+async get(idOrOnChainId: string): Promise<Invoice>
+```
+
+```ts
+const invoice = await api.invoices.get("inv_01HXY…");
+console.log(invoice.status); // PENDING / PAID / EXPIRED / FAILED
+```
+
+---
+
+## Intent flow
+
+Three V2 endpoints return intents instead of performing a chain write
+themselves:
+
+- `api.merchants.createRegistrationIntent(...)` → `MerchantRegistrationIntent`
+- `api.plans.create(...)` → `PlanIntent`
+- `api.subscriptions.cancelIntent(id)` → `CancelIntent`
+
+Each result includes an `encodedTx` (ABI-encoded calldata) for the merchant's
+wallet to sign and broadcast against `SubscriptionManager`. The backend never
+holds merchant keys; it only observes the resulting on-chain event and
+reconciles state.
+
+The expected flow:
+
+1. Backend (server) calls the SDK and receives the intent.
+2. Intent is forwarded to the merchant's browser / signing surface.
+3. Merchant wallet sends a transaction with `to = SubscriptionManager`,
+   `data = encodedTx`, and the matching `chainId`.
+4. Chain listener observes the event and fires the corresponding webhook
+   (`merchant.registered`, `plan.created`, `subscription.cancelled`).
+
+### Executing an intent with viem
+
+```ts
+import { createWalletClient, custom } from "viem";
+import { arbitrum } from "viem/chains";
+
+const wallet = createWalletClient({
+  chain: arbitrum,
+  transport: custom(window.ethereum),
+});
+const [account] = await wallet.requestAddresses();
+
+const intent = await api.plans.create({
+  externalPlanCode: "premium-monthly",
+  tokenAddress: USDC_ARBITRUM,
+  amount: "9990000",
+  monthsPerCycle: 1,
+  bufferTimeSeconds: 86_400,
+  chainId: arbitrum.id,
+});
+
+const txHash = await wallet.sendTransaction({
+  account,
+  to: SUBSCRIPTION_MANAGER_ADDRESS,
+  data: intent.encodedTx,
+});
+// Wait for the `plan.created` webhook to confirm the chain has settled.
+```
+
+The same pattern applies to registration and cancel intents — only the
+`encodedTx` payload differs.
+
+---
+
+## Type reference
+
+All types listed below are exported from `@butterpay/core` and originate in
+`src/types.ts`.
+
+### `Invoice`
+
+```ts
+interface Invoice {
+  id: string;
+  merchantId: string;
+  merchantOrderId?: string | null;
+  amount: string;
+  /** "USD" until paid, then the actual ERC20 symbol */
+  token: string;
+  /** "pending" until paid, then the chain name */
+  chain: string;
+  /** PENDING | PAID | EXPIRED | FAILED */
+  status: string;
+  onChainInvoiceId?: `0x${string}` | null;
+  paymentMethod?: string | null;
+  payerAddress?: string | null;
+  txHash?: string | null;
+  serviceFee?: string | null;
+  merchantNet?: string | null;
+  referrerAddress?: string | null;
+  referrerFeeBps?: number | null;
+  createdAt: string;
+}
+```
+
+### `InvoiceCreated`
+
+```ts
+interface InvoiceCreated {
+  id: string;
+  onChainInvoiceId: `0x${string}`;
+  amountUsd: string;
+  status: string;
+  merchantOrderId: string | null;
+  description: string | null;
+  createdAt: string;
+  payUrl: string;
+  /** @deprecated renamed to `onChainInvoiceId` in 0.2.0 */
+  invoiceId?: `0x${string}`;
+}
+```
+
+### `Plan`
+
+```ts
+interface Plan {
+  id: string;
+  merchantId: string;
+  externalPlanCode: string;
+  onChainPlanId: `0x${string}`;
+  tokenAddress: `0x${string}`;
+  amount: string;            // smallest unit of tokenAddress
+  monthsPerCycle: number;
+  bufferTimeSeconds: number;
+  metadataHash: `0x${string}`;
+  active: boolean;
+  chainId: number;
+  createdAt?: string;
+}
+```
+
+### `Subscription`
+
+```ts
+interface Subscription {
+  id: string;
+  planId: string;
+  onChainSubId: string;
+  subscriber: `0x${string}`;
+  status: string;
+  anchorTime?: string;
+  anchorDay?: number;
+  cyclesCharged?: number;
+  nextDueAt?: string;
+  chainId: number;
+  createdAt?: string;
+}
+```
+
+### `MerchantRegistrationIntent`
+
+```ts
+interface MerchantRegistrationIntent {
+  metadataHash: `0x${string}`;
+  metadataJson: string;
+  encodedTx: `0x${string}`;
+}
+```
+
+### `PlanIntent`
+
+```ts
+interface PlanIntent {
+  planId: `0x${string}`;
+  salt: `0x${string}`;
+  metadataHash: `0x${string}`;
+  encodedTx: `0x${string}`;
+}
+```
+
+### `CancelIntent`
+
+```ts
+interface CancelIntent {
+  encodedTx: `0x${string}`;
+  onChainSubId: string;
+  chainId: number;
+}
+```
+
+### Webhook events
+
+`WebhookEvent` is a discriminated union covering every V2 event. The HTTP body
+is `{ event, data }` and is signed with
+`X-ButterPay-Signature: t=<unix>,v1=<hmac-sha256-hex>` against `${t}.${rawBody}`.
+
+```ts
+import type { WebhookEvent } from "@butterpay/core";
+
+function handle(event: WebhookEvent) {
+  switch (event.type) {
+    case "merchant.registered":   /* { merchantId, onChainMerchantId, txHash, chainId } */ break;
+    case "plan.created":          /* { planId, externalPlanCode, chainId, txHash }     */ break;
+    case "plan.deactivated":      /* { planId, chainId }                                */ break;
+    case "subscription.created":  /* { subscriptionId, planId, subscriber, … }          */ break;
+    case "subscription.charged":  /* { subscriptionId, cyclesCharged, amount, … }       */ break;
+    case "subscription.charge_failed": /* { subscriptionId, errorCode, errorMessage }   */ break;
+    case "subscription.expired":  /* { subscriptionId, lastCyclesCharged, reason }      */ break;
+    case "subscription.cancelled":/* { subscriptionId, cancelledBy }                    */ break;
+    case "subscription.resubscribed": /* { subscriptionId, newAnchorTime }              */ break;
+    case "payment.confirmed":     /* { invoiceId, txHash, amountPaid, merchantNet }     */ break;
+    case "payment.expired":       /* { invoiceId }                                      */ break;
+  }
+}
+```
+
+---
+
+## Migration from 0.1.x
+
+The 0.3.0 SDK targets the V2 contract and is not API-compatible with 0.1.x.
+The most common breakages:
+
+| 0.1.x | 0.3.0 |
+|---|---|
+| `api.createInvoice({ amount, token, chain, … })` | `api.invoices.create({ amountUsd, … })` |
+| `api.getInvoice(id)` | `api.invoices.get(id)` |
+| `sdk.waitForConfirmation(id)` | Removed — listen for the `payment.confirmed` webhook. |
+| `sdk.pay(...)` | Removed — share `payUrl` from `api.invoices.create()` instead. |
+| `invoiceIdBytes32` (computed client-side) | `onChainInvoiceId` returned on `InvoiceCreated`. |
+| `InvoiceCreated.invoiceId` | `@deprecated` — use `id` (DB) or `onChainInvoiceId` (bytes32). |
+| `api.createPlan({ name, intervalSeconds, cycles, amountUsd })` | `api.plans.create({ externalPlanCode, tokenAddress, amount, monthsPerCycle, bufferTimeSeconds, chainId })` — returns an intent. |
+| `api.cancelSubscription(id)` (server-side cancel) | `api.subscriptions.cancelIntent(id)` — merchant wallet signs. |
+| Subscription created via `sdk.subscribe(...)` | Removed — subscriber wallet calls `SubscriptionManager.subscribe(bytes32)` directly. |
+
+The V1 webhook events (`payment.initiated`, `subscription.activated`,
+`subscription.paused`, `subscription.completed`, `subscription.canceled`) no
+longer exist. Use the V2 list above.
 
 ---
 

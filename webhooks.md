@@ -1,8 +1,8 @@
 # Webhooks
 
-ButterPay sends webhooks as HTTP POST requests to your registered endpoint whenever the state of
-a payment or subscription changes. Each delivery includes a signed payload so you can verify it
-originated from ButterPay before acting on it.
+ButterPay sends webhooks as HTTP POST requests to your registered endpoint whenever a relevant
+on-chain event is observed and confirmed. Each delivery includes a signed payload so you can
+verify it originated from ButterPay before acting on it.
 
 ---
 
@@ -33,143 +33,226 @@ should be a no-op.
 
 ## Event types
 
+All events listed below are emitted only after the corresponding on-chain event has reached the
+configured confirmation depth. ButterPay does not deliver speculative or unconfirmed events.
+
 | Event | When it fires |
 |-------|---------------|
-| `payment.initiated` | Customer has submitted a transaction on-chain; confirmation is pending |
-| `payment.confirmed` | Required on-chain confirmations reached and amount verified |
-| `payment.failed` | On-chain transaction reverted, or confirmed amount fell below the invoice amount |
-| `payment.expired` | Invoice TTL elapsed before a transaction was detected |
-| `subscription.activated` | New subscription created; first charge collected on-chain |
-| `subscription.charged` | Recurring charge succeeded for an existing subscription |
-| `subscription.charge_failed` | Recurring charge attempt failed; subscription moves to `past_due` |
-| `subscription.canceled` | Subscription canceled by the merchant or via API |
+| `merchant.registered` | A `MerchantRegistered` event was observed for your merchant on-chain |
+| `payment.confirmed` | A `PaymentProcessed` event for a one-time invoice was observed and verified |
+| `payment.expired` | An invoice's TTL (30 minutes) elapsed before any payment was detected |
+| `plan.created` | A `PlanCreated` event was observed for one of your plans |
+| `plan.deactivated` | A `PlanActiveChanged(false)` event was observed for one of your plans |
+| `subscription.created` | A `Subscribed` event was observed (new subscriber) |
+| `subscription.charged` | A `Charged` event was observed for a billing cycle |
+| `subscription.cancelled` | A `Cancelled` event was observed (note the double-L spelling) |
+| `subscription.expired` | An `ExpiredByFailure` event was observed (subscriber's allowance or balance ran out and the on-chain subscription terminated) |
+| `subscription.resubscribed` | A `Resubscribed` event was observed (a previously cancelled or expired subscriber re-subscribed) |
 
-> `payment.test` is a synthetic event fired only by `POST /v1/webhooks/test`. It is never
-> emitted as part of real payment processing.
+> ButterPay does not currently fire a per-cycle `subscription.charge_failed` webhook. When a
+> subscriber's allowance or balance runs out, the on-chain contract eventually emits
+> `ExpiredByFailure`, which ButterPay delivers as `subscription.expired`. Use that event to
+> detect involuntary churn.
+
+> The test endpoint (`POST /v1/webhooks/test`) lets you send any of the events above to your
+> webhook URL with synthetic data. See [Testing webhooks](#testing-webhooks).
 
 ---
 
 ## Payload shape
 
-Every event shares the same top-level envelope. Fields that are not applicable to a given event
-are omitted.
+Every event uses the same envelope:
 
 ```json
 {
-  "event": "payment.confirmed",
-  "invoiceId": "inv_01hwz4m8y3g9c5d7f8h0j2kn",
-  "merchantOrderId": "order-9182",
-  "amountUsd": "49.99",
-  "tokenAmount": "49.99",
-  "serviceFee": "0.40",
-  "merchantReceived": "49.59",
-  "paymentMethod": "crypto",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "txHash": "0xabc123...",
-  "eventVerified": true,
-  "timestamp": "2026-04-27T14:32:01.000Z"
+  "event": "<event_name>",
+  "data": { ... }
 }
 ```
 
-**Envelope fields**
+The shape of `data` is determined by the `event` field. The full table of `data` fields per
+event type is below; an example payload for each event is shown in
+[Example payloads](#example-payloads).
+
+| Event | `data` fields |
+|-------|---------------|
+| `merchant.registered` | `merchantId`, `onChainMerchantId`, `txHash`, `chainId` |
+| `payment.confirmed` | `invoiceId`, `txHash`, `amountPaid`, `merchantNet` |
+| `payment.expired` | `invoiceId` |
+| `plan.created` | `planId`, `externalPlanCode`, `chainId`, `txHash` |
+| `plan.deactivated` | `planId`, `chainId` |
+| `subscription.created` | `subscriptionId`, `planId`, `subscriber`, `anchorTime`, `anchorDay` |
+| `subscription.charged` | `subscriptionId`, `cyclesCharged`, `amount`, `merchantNet`, `txHash` |
+| `subscription.cancelled` | `subscriptionId`, `cancelledBy` (`"user"` \| `"merchant"` \| `"plan_closed"`) |
+| `subscription.expired` | `subscriptionId`, `lastCyclesCharged`, `reason` |
+| `subscription.resubscribed` | `subscriptionId`, `newAnchorTime` |
+
+**Common field semantics**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `event` | string | Event name (see table above) |
-| `invoiceId` | string | ButterPay invoice ID — present on all payment events |
-| `merchantOrderId` | string | Your own order reference, if set when creating the invoice |
-| `amountUsd` | string | Invoice amount in USD |
-| `tokenAmount` | string | On-chain amount in the stablecoin's native units |
-| `serviceFee` | string | ButterPay fee deducted (0.8%) |
-| `merchantReceived` | string | Net amount received after fee |
-| `paymentMethod` | string | Always `"crypto"` for on-chain payments |
-| `chain` | string | Chain identifier, e.g. `"arbitrum"` |
-| `token` | string | `"USDT"` or `"USDC"` |
-| `txHash` | string | On-chain transaction hash |
-| `eventVerified` | boolean | Whether the `PaymentProcessed` contract event was found and verified |
-| `subscriptionId` | string | Present on all `subscription.*` events |
-| `planId` | string | Subscription plan ID, if the subscription was created from a plan |
-| `subscriberAddress` | string | Customer wallet address |
-| `cyclesCharged` | number | Number of billing cycles completed so far |
-| `cyclesTotal` | number | Total billing cycles for the subscription |
-| `errorCode` | string | Machine-readable failure code. Present on `payment.failed` and `subscription.charge_failed` events only. See [Error codes](#error-codes). |
-| `errorMessage` | string | Human-readable description of the failure. Present alongside `errorCode`. |
-| `timestamp` | string | ISO 8601 timestamp of the event |
+| `data` | object | Event-specific payload |
+| `merchantId` | string | Internal ButterPay merchant ID (`mer_…`) |
+| `onChainMerchantId` | string | The `merchantId` value emitted by the contract (decimal string) |
+| `chainId` | number | EVM chain ID, e.g. `42161` for Arbitrum One |
+| `txHash` | string | On-chain transaction hash that produced the event |
+| `invoiceId` | string | One-time invoice ID — internal UUID or on-chain `bytes32` depending on context |
+| `amountPaid` | string | Token amount transferred by the payer (smallest unit, e.g. USDC's 6-decimal base units) |
+| `merchantNet` | string | Token amount delivered to the merchant after fees (smallest unit) |
+| `planId` | string | Plan identifier — for plan and subscription events this is the on-chain `bytes32` plan ID |
+| `externalPlanCode` | string | Merchant-supplied plan code (may be empty if the plan was created on-chain only) |
+| `subscriptionId` | string | Subscription identifier — internal UUID or on-chain subscription ID |
+| `subscriber` | string | Subscriber wallet address (`0x…`) |
+| `anchorTime` | string | ISO 8601 timestamp of the subscription anchor point |
+| `anchorDay` | number | Day-of-month (1-28) used for monthly anchoring |
+| `cyclesCharged` | number | Total number of cycles charged for this subscription so far |
+| `amount` | string | Token amount charged this cycle (smallest unit) |
+| `cancelledBy` | string | `"user"`, `"merchant"`, or `"plan_closed"` |
+| `lastCyclesCharged` | number | Final cycle count at the moment the subscription expired |
+| `reason` | string | Raw `bytes32` reason from the contract event (hex-encoded), or a known label |
+| `newAnchorTime` | string | ISO 8601 timestamp of the new anchor after a re-subscribe |
 
-### Example: `payment.confirmed`
+> Token amounts are reported in the token's smallest base unit (e.g. for USDC on Arbitrum,
+> `"10000000"` represents `10.000000` USDC). Convert using the token's `decimals` value.
+
+---
+
+## Example payloads
+
+### `merchant.registered`
+
+```json
+{
+  "event": "merchant.registered",
+  "data": {
+    "merchantId": "mer_01hwz4m8y3g9c5d7f8h0j2kn",
+    "onChainMerchantId": "42",
+    "txHash": "0xabc123def456...",
+    "chainId": 42161
+  }
+}
+```
+
+### `payment.confirmed`
 
 ```json
 {
   "event": "payment.confirmed",
-  "invoiceId": "inv_01hwz4m8y3g9c5d7f8h0j2kn",
-  "merchantOrderId": "order-9182",
-  "amountUsd": "49.99",
-  "tokenAmount": "49.99",
-  "serviceFee": "0.40",
-  "merchantReceived": "49.59",
-  "paymentMethod": "crypto",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "txHash": "0xabc123def456...",
-  "eventVerified": true,
-  "timestamp": "2026-04-27T14:32:01.000Z"
+  "data": {
+    "invoiceId": "inv_01hwz4m8y3g9c5d7f8h0j2kn",
+    "txHash": "0xabc123def456...",
+    "amountPaid": "49990000",
+    "merchantNet": "49590200"
+  }
 }
 ```
 
-### Example: `payment.failed`
+### `payment.expired`
 
 ```json
 {
-  "event": "payment.failed",
-  "invoiceId": "inv_01hwz4m8y3g9c5d7f8h0j2kn",
-  "merchantOrderId": "order-9182",
-  "amountUsd": "49.99",
-  "tokenAmount": "49.99",
-  "paymentMethod": "crypto",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "txHash": "0xabc123def456...",
-  "eventVerified": false,
-  "errorCode": "USER_BALANCE_INSUFFICIENT",
-  "errorMessage": "Subscriber wallet has insufficient token balance.",
-  "timestamp": "2026-04-27T14:32:01.000Z"
+  "event": "payment.expired",
+  "data": {
+    "invoiceId": "inv_01hwz4m8y3g9c5d7f8h0j2kn"
+  }
 }
 ```
 
-### Example: `subscription.charged`
+### `plan.created`
+
+```json
+{
+  "event": "plan.created",
+  "data": {
+    "planId": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "externalPlanCode": "pro-monthly",
+    "chainId": 42161,
+    "txHash": "0xcd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34cd34"
+  }
+}
+```
+
+### `plan.deactivated`
+
+```json
+{
+  "event": "plan.deactivated",
+  "data": {
+    "planId": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "chainId": 42161
+  }
+}
+```
+
+### `subscription.created`
+
+```json
+{
+  "event": "subscription.created",
+  "data": {
+    "subscriptionId": "sub_01hwz9p4q5r6s7t8u9v0w1xy",
+    "planId": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "subscriber": "0x2222222222222222222222222222222222222222",
+    "anchorTime": "2026-05-01T00:00:00.000Z",
+    "anchorDay": 1
+  }
+}
+```
+
+### `subscription.charged`
 
 ```json
 {
   "event": "subscription.charged",
-  "subscriptionId": "sub_01hwz9p4q5r6s7t8u9v0w1xy",
-  "planId": "plan_01hwz2a3b4c5d6e7f8g9h0jk",
-  "subscriberAddress": "0xCustomerWalletAddress",
-  "amountUsd": "19.99",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "cyclesCharged": 3,
-  "cyclesTotal": 12,
-  "timestamp": "2026-04-27T14:32:01.000Z"
+  "data": {
+    "subscriptionId": "sub_01hwz9p4q5r6s7t8u9v0w1xy",
+    "cyclesCharged": 3,
+    "amount": "19990000",
+    "merchantNet": "19830080",
+    "txHash": "0xefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef"
+  }
 }
 ```
 
-### Example: `subscription.charge_failed`
+### `subscription.cancelled`
 
 ```json
 {
-  "event": "subscription.charge_failed",
-  "subscriptionId": "sub_01hwz9p4q5r6s7t8u9v0w1xy",
-  "planId": "plan_01hwz2a3b4c5d6e7f8g9h0jk",
-  "subscriberAddress": "0xCustomerWalletAddress",
-  "amountUsd": "19.99",
-  "chain": "arbitrum",
-  "token": "USDT",
-  "cyclesCharged": 3,
-  "cyclesTotal": 12,
-  "errorCode": "USER_ALLOWANCE_INSUFFICIENT",
-  "errorMessage": "Approved allowance was less than the charge amount.",
-  "timestamp": "2026-04-27T14:32:01.000Z"
+  "event": "subscription.cancelled",
+  "data": {
+    "subscriptionId": "sub_01hwz9p4q5r6s7t8u9v0w1xy",
+    "cancelledBy": "user"
+  }
+}
+```
+
+### `subscription.expired`
+
+```json
+{
+  "event": "subscription.expired",
+  "data": {
+    "subscriptionId": "sub_01hwz9p4q5r6s7t8u9v0w1xy",
+    "lastCyclesCharged": 4,
+    "reason": "0x0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
+```
+
+`subscription.expired` is fired when the on-chain contract emits `ExpiredByFailure` — typically
+because the subscriber's allowance or balance ran out and a scheduled charge could not settle.
+Treat this as terminal involuntary churn for the subscription.
+
+### `subscription.resubscribed`
+
+```json
+{
+  "event": "subscription.resubscribed",
+  "data": {
+    "subscriptionId": "sub_01hwz9p4q5r6s7t8u9v0w1xy",
+    "newAnchorTime": "2026-06-01T00:00:00.000Z"
+  }
 }
 ```
 
@@ -177,25 +260,22 @@ are omitted.
 
 ## Error codes
 
-Failed payment and subscription events include a structured `errorCode` so you can route
-programmatically — for example, notifying the user to top up versus ignoring an error that is
-on ButterPay's side. Internal infrastructure errors are not delivered as webhooks; they go to
-our ops alerts. The codes you may receive are listed below.
+Most ButterPay webhook events do not carry an error code. Event delivery on V2 follows the
+on-chain state machine: a payment either reaches `payment.confirmed` (the `PaymentProcessed`
+event was observed) or `payment.expired` (the invoice TTL elapsed without a transaction).
+Reverted on-chain transactions produce no event and therefore no webhook — your integration
+should rely on the absence of `payment.confirmed` plus the eventual `payment.expired`, not on a
+failure event.
 
-| Code | When it fires | Suggested action |
-|------|---------------|------------------|
-| `USER_BALANCE_INSUFFICIENT` | Subscriber wallet has insufficient token balance | Notify user; consider letting them top up before retrying. |
-| `USER_ALLOWANCE_INSUFFICIENT` | Approved allowance was less than the charge amount | Ask user to re-approve with a higher amount. |
-| `USER_ALLOWANCE_REVOKED` | Subscriber revoked the approval | Subscription is effectively cancelled by the user; mark as churned. |
-| `SUBSCRIPTION_EXPIRED` | On-chain subscription has reached its `cyclesTotal` | End-of-life; offer a renewal. |
-| `CONTRACT_REVERTED` | On-chain transaction reverted with an unrecognized reason | Inspect the failed tx hash on the explorer; may indicate a token blacklist or paused contract. |
-| `CHARGE_AMOUNT_MISMATCH` | On-chain transferred amount does not match the invoice amount within tolerance | Treat as failed; do not deliver goods. May indicate front-running or fee-on-transfer token mismatch. |
+Similarly for subscriptions: an individual cycle that fails to settle does not produce a
+webhook. ButterPay only delivers `subscription.expired` once the on-chain contract emits
+`ExpiredByFailure`, which terminates the subscription. The `data.reason` field on
+`subscription.expired` carries the raw `bytes32` reason from the contract event; treat
+unrecognized values as opaque.
 
-Codes `RELAYER_GAS_INSUFFICIENT`, `RELAYER_KEY_MISSING`, and `RELAYER_TX_FAILED` indicate a
-problem on ButterPay's infrastructure and are never sent to merchants. They are routed to
-internal ops alerts. If you observe a failed event with no `errorCode`, or a delivery that
-never arrived, check your logs endpoint and contact support — do not attempt to handle these
-codes in your integration.
+If you observe stuck or unexpected behavior, query `GET /v1/webhooks/logs` and `GET /v1/invoices`
+or `GET /v1/subscriptions` to inspect the underlying state, and contact support with the
+relevant `txHash`.
 
 ---
 
@@ -411,20 +491,28 @@ than creating new ones. Storing the log `id` and skipping processing when you se
 value is sufficient for most use cases.
 
 For payment events, the combination of `invoiceId` + `event` is also unique per invoice
-lifecycle (an invoice can only be `confirmed` or `failed` once), and can serve as a simpler
+lifecycle (an invoice can only be `confirmed` or `expired` once), and can serve as a simpler
 deduplication strategy if you do not wish to query the logs endpoint.
+
+For subscription events, `subscriptionId` + `event` + `cyclesCharged` (where applicable) is a
+stable per-cycle key.
 
 ---
 
 ## Testing webhooks
 
-`POST /v1/webhooks/test` sends a synthetic `payment.test` payload to your currently configured
-webhook URL. The request is authenticated with your API key and the payload is signed with your
-webhook secret, so your verification logic runs exactly as it would for a real event.
+`POST /v1/webhooks/test` sends a synthetic payload to your currently configured webhook URL.
+The request is authenticated with your API key and the payload is signed with your webhook
+secret, so your verification logic runs exactly as it would for a real event.
+
+You may select any V2 event type listed in [Event types](#event-types). The test endpoint
+populates the `data` object with placeholder values that match the production schema.
 
 ```bash
 curl -X POST https://api.butterpay.io/v1/webhooks/test \
-  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  -H "X-Api-Key: bp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" \
+  -H "Content-Type: application/json" \
+  -d '{"event":"payment.confirmed"}'
 ```
 
 **Response**
@@ -447,9 +535,11 @@ delivery is attempted:
 }
 ```
 
-The synthetic payload uses `invoiceId: "inv_test_000000000000"` and
-`txHash: "0x000...000"`. It is safe to receive this in production as long as your handler
-checks the `event` field before performing business logic.
+Test deliveries also include an `X-ButterPay-Test: true` header so your handler can short-circuit
+business logic when receiving them in production. The synthetic payloads use placeholder IDs
+(e.g. `inv_test_…`, `sub_test_…`) and a deterministic `txHash` of repeating bytes, which are
+safe to receive as long as your handler checks for the test header (or the placeholder IDs)
+before performing real-world side effects.
 
 ---
 
@@ -480,11 +570,14 @@ Use a public HTTPS endpoint. For local development, tools such as
 [ngrok](https://ngrok.com) or [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
 expose a local server under a public HTTPS URL.
 
-**Webhook payload includes `errorCode` field**
+**Expected `payment.failed` or `subscription.charge_failed` event never arrives**
 
-See [Error codes](#error-codes) for the full list of merchant-visible codes and recommended
-actions per code. Codes beginning with `RELAYER_` indicate a ButterPay infrastructure issue
-and are never sent to your endpoint.
+V2 does not deliver per-attempt failure webhooks. Reverted on-chain transactions emit no event
+and produce no webhook; for invoices, the absence of `payment.confirmed` followed by
+`payment.expired` indicates the payment did not settle. For subscriptions, repeated cycle
+failures eventually trigger `ExpiredByFailure` on-chain, which is delivered as
+`subscription.expired`. If you need per-attempt visibility, poll `GET /v1/invoices` or
+`GET /v1/subscriptions`.
 
 **Retries exhausted — delivery marked failed**
 
@@ -496,4 +589,5 @@ Check `GET /v1/webhooks/logs` to see the `response` field from your server and t
 - A TLS certificate error prevented the connection.
 
 Fix the underlying issue, then handle any missed events by replaying the payloads from the
-logs response or by querying the affected invoices via `GET /v1/invoices`.
+logs response or by querying the affected invoices via `GET /v1/invoices` or subscriptions via
+`GET /v1/subscriptions`.
