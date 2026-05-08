@@ -190,7 +190,7 @@ the following variables causes the process to exit before accepting requests:
 | Variable | Purpose |
 |----------|---------|
 | `JWT_SECRET` | Signs all JWTs — login tokens, session tokens, and any other JWT issued by the API |
-| `CORS_ORIGIN` | Comma-separated list of allowed origins (e.g. `https://app.butterpay.io,https://pay.butterpay.io`) |
+| `CORS_ORIGIN` | Comma-separated list of allowed origins (e.g. `https://dashboard.butterpay.io`) |
 
 In development, `JWT_SECRET` defaults to `dev-jwt-secret-change-in-production` and CORS
 reflects all origins. These defaults must never be used in a production deployment.

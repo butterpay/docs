@@ -181,7 +181,7 @@ curl https://api.butterpay.io/v1/plans \
 
 ## GetPlan
 
-Public endpoint used by the hosted subscribe page (`pay.butterpay.io/subscribe/:planId`). It accepts **either** the `pln_*` database id **or** the on-chain `0x...` `onChainPlanId` as the path parameter.
+Public endpoint used by the hosted subscribe page (`dashboard.butterpay.io/subscribe/:planId`). It accepts **either** the `pln_*` database id **or** the on-chain `0x...` `onChainPlanId` as the path parameter.
 
 Returns `404` when the plan does not exist or is not yet `active=true` (i.e. the `PlanCreated` event has not been observed yet, or the plan has been deactivated on chain).
 

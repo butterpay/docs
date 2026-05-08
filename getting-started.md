@@ -146,13 +146,13 @@ The `id` field is the invoice identifier used to build the payment URL.
 Construct the hosted payment URL from the invoice `id`:
 
 ```
-https://pay.butterpay.io/pay/<invoice.id>
+https://dashboard.butterpay.io/pay/<invoice.id>
 ```
 
 Example:
 
 ```
-https://pay.butterpay.io/pay/inv_01hwz4m8y3g9c5d7f8h0j2kn
+https://dashboard.butterpay.io/pay/inv_01hwz4m8y3g9c5d7f8h0j2kn
 ```
 
 Send this URL to your customer by email, redirect them to it, or embed it as a button. The payment
@@ -322,7 +322,7 @@ async function main() {
     apiKeyHeaders
   );
   console.log(`   Invoice ID: ${invoice.id}`);
-  console.log(`   Payment URL: https://pay.butterpay.io/pay/${invoice.id}`);
+  console.log(`   Payment URL: https://dashboard.butterpay.io/pay/${invoice.id}`);
 }
 
 main().catch((err) => {

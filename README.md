@@ -18,4 +18,4 @@ This documentation covers the public HTTP API and the official `@butterpay/core`
 - Arbitrum mainnet **live**
 - Ethereum / BSC / Polygon **coming soon** (audit pending)
 - API: `https://api.butterpay.io`
-- Hosted payment page: `https://pay.butterpay.io`
+- Dashboard + hosted pages: `https://dashboard.butterpay.io` (e.g. `/pay/<invoiceId>`, `/subscribe/<planId>`)

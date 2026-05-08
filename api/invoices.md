@@ -53,7 +53,7 @@ on-chain `PaymentProcessed` event is observed.
   "merchantOrderId": "order_001",
   "description": "Order #1234",
   "createdAt": "2026-05-05T06:11:09.500Z",
-  "payUrl": "https://pay.butterpay.io/pay/inv_dudkhayh6ntw7ou7uz97mhfn"
+  "payUrl": "https://dashboard.butterpay.io/pay/inv_dudkhayh6ntw7ou7uz97mhfn"
 }
 ```
 
@@ -92,7 +92,7 @@ Response:
   "merchantOrderId": "order_001",
   "description": "Order #1234",
   "createdAt": "2026-05-05T06:11:09.500Z",
-  "payUrl": "https://pay.butterpay.io/pay/inv_dudkhayh6ntw7ou7uz97mhfn"
+  "payUrl": "https://dashboard.butterpay.io/pay/inv_dudkhayh6ntw7ou7uz97mhfn"
 }
 ```
 
