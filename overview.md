@@ -13,7 +13,7 @@ works without modification. A flat 0.8% service fee is deducted at the moment of
 2. **Create invoice** — `POST /v1/invoices` with `amountUsd` and an optional `merchantOrderId` /
    `description`. The API returns the full invoice row including `id` (DB id, e.g. `inv_…`),
    `onChainInvoiceId` (bytes32 used on chain), and a hosted `payUrl`
-   (`pay.butterpay.io/pay/<id>`).
+   (`dashboard.butterpay.io/pay/<id>`).
 3. **Customer pays** — the customer opens the payment URL, connects a wallet, selects a token,
    and signs `approve` + `pay()` on `PayRouter`. The contract atomically splits the transfer:
    99.2% to the merchant's `receiverAddress`, 0.8% to the fee collector — non-custodial, in a
@@ -24,8 +24,8 @@ works without modification. A flat 0.8% service fee is deducted at the moment of
 
 ## Architecture
 
-- **Frontend**: `pay.butterpay.io` — hosted payment pages (`/pay/<id>`) and subscription pages
-  (`/subscribe/<planId>`); merchant dashboard at the same domain.
+- **Frontend**: `dashboard.butterpay.io` — merchant dashboard, plus hosted payment pages
+  (`/pay/<id>`) and subscription pages (`/subscribe/<planId>`) on the same domain.
 - **Backend API**: `api.butterpay.io` — REST API, accepts `Authorization: Bearer <jwt>` or
   `X-Api-Key: <key>` depending on the endpoint.
 - **Smart contracts**: `PaymentRouter` handles one-time payments; `SubscriptionManager` handles
