@@ -8,6 +8,7 @@
 * [Getting Started](getting-started.md)
 * [Authentication](authentication.md)
 * [Webhooks](webhooks.md)
+* [Telegram Mini App](integration-tg.md)
 
 ## API Reference
 
